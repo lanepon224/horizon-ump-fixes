@@ -1,5 +1,7 @@
 # UMP fixes for Horizon and the Horizon Java Bridge
 
+> **Unfinished and unowned.** This is an unfinished side project with no owner or maintainer: nobody is responsible for it, it gets no support, and it may stop at any time. Anyone is free to take it, fork it, finish it or merge any part of it upstream (MIT, like Horizon and the Java bridge). Not affiliated with Horizon, the Java bridge, Mojang or Microsoft.
+
 Fixes made while getting real Fabric 26.3 modpacks (100-300 mods) to run plug-and-play in
 [Horizon](https://github.com/horizon-rust/horizon) through the
 [Horizon Java Bridge](https://github.com/iaxivers/horizon-java-bridge). MIT, like both projects.
