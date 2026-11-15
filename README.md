@@ -120,6 +120,13 @@ downloads. Candidates for pull requests to iaxivers/horizon-java-bridge.
 - Test suite: 77/77 checks on real mod packs (blocks, items, mobs, screens, machines, save/reload,
   shaders, a new-player run).
 
+## Where the code lives
+
+- Full branch with all 90 commits, on the Java bridge: https://github.com/lanepon224/horizon-java-bridge/tree/ump-fixes
+- Offered to the bridge as a draft pull request: https://github.com/iaxivers/horizon-java-bridge/pull/2
+
+Anyone is welcome to fork it and build on it.
+
 ## Not finished
 
 - Merging Horizon's newer main (16,161 commits since 2026-11-05) is in progress.
