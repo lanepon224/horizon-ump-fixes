@@ -1,0 +1,292 @@
+From 622e3574f9a621b3c2cb831e7f6a5a62e96b56c3 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 35/90] java mods: far canopies take the mods' biomes' own tree
+ leaves
+
+Far terrain plants Horizon's trees (vanilla's oak, birch, spruce); in the mods' biomes the real ones are the mods' (Biomes O' Plenty's firs and maples). HorizonWorldgen.lodFoliage gives each of the mods' biomes the leaves most of its trees have: vanilla tree features' foliage providers, and a mod's own tree types' leaves read from their encoded form. Far columns in those biomes take them. Vanilla's biomes keep Horizon's trees.
+
+UMP far_truth, 100 mods: coniferous forest far tops are fir leaves like the world's (oak/birch/poplar before).
+---
+ .../horizon-client/src/game/java_worldgen.rs  |  66 +++++++++++
+ .../horizonlab/platform/HorizonServer.java    |   4 +
+ .../horizonlab/platform/HorizonWorldgen.java  | 105 ++++++++++++++++++
+ crates/horizon-jvm/src/events.rs              |  26 +++++
+ 4 files changed, 201 insertions(+)
+
+diff --git a/crates/horizon-client/src/game/java_worldgen.rs b/crates/horizon-client/src/game/java_worldgen.rs
+index 37b8f70dc5..ed94f1a090 100644
+--- a/crates/horizon-client/src/game/java_worldgen.rs
++++ b/crates/horizon-client/src/game/java_worldgen.rs
+@@ -374,6 +374,7 @@ impl ChunkGenerator for JavaTerrain {
+             custom: self.custom.clone(),
+             registry: self.registry,
+             materials: Arc::new(OnceLock::new()),
++            foliage: Arc::new(OnceLock::new()),
+             oracle: JavaBiomes {
+                 dimension: self.dimension.clone(),
+                 biomes: self.biomes.clone(),
+@@ -678,6 +679,8 @@ struct JavaLod {
+     /// What the land is made of ([`JavaLod::materials`]), shared by the samplers.
+     materials:
+         Arc<OnceLock<Option<std::collections::HashSet<horizon_world::registry::BlockStateId>>>>,
++    /// Each of the mods' biomes' tree leaves, by biome id ([`JavaLod::foliage`]).
++    foliage: Arc<OnceLock<std::collections::HashMap<u16, horizon_world::registry::BlockStateId>>>,
+     oracle: JavaBiomes,
+ }
+ 
+@@ -873,6 +876,67 @@ impl JavaLod {
+         }
+     }
+ 
++    /// The mods' biomes' tree leaves by biome id, asked once (`HorizonWorldgen.lodFoliage`).
++    fn foliage(&self) -> &std::collections::HashMap<u16, horizon_world::registry::BlockStateId> {
++        self.foliage.get_or_init(|| {
++            let pairs = horizon_jvm::events::worldgen_lod_foliage(&self.oracle.dimension)
++                .ok()
++                .flatten()
++                .unwrap_or_default();
++            log::info!(
++                "Java mods: far canopies: {} of the mods' biomes have their own trees ({})",
++                pairs.len(),
++                pairs
++                    .iter()
++                    .take(12)
++                    .map(|(b, s)| format!("{b}={s}"))
++                    .collect::<Vec<_>>()
++                    .join(", ")
++            );
++            pairs
++                .iter()
++                .filter_map(|(biome, state)| {
++                    // An id Horizon doesn't know falls back to plains there: skipped instead.
++                    let id = self.oracle.biomes.id(biome);
++                    if self.oracle.biomes.get(id).name != *biome {
++                        return None;
++                    }
++                    Some((id, parse_state(self.registry, state)?))
++                })
++                .collect()
++        })
++    }
++
++    /// Far canopies take their biome's own trees' leaves: Horizon plants its trees (vanilla's
++    /// oak, birch, spruce) in a far tile, and in the mods' biomes those are the mods' (Biomes O'
++    /// Plenty's fir and maple). UMP far_truth: 1 in 11 far tops matched the world before.
++    fn leaves(&self, columns: &mut [&mut horizon_client::lod::Column]) {
++        let foliage = self.foliage();
++        if foliage.is_empty() {
++            return;
++        }
++        for column in columns.iter_mut() {
++            let Some(top) = column.spans.last() else { continue };
++            let Some(&leaves) = foliage.get(&top.biome) else { continue };
++            for span in column.spans.iter_mut() {
++                if span.state != leaves && self.is_leaves(span.state) {
++                    span.state = leaves;
++                }
++            }
++            if let Some(surface) = column.surface.as_mut()
++                && self.is_leaves(surface.state)
++            {
++                surface.state = leaves;
++            }
++        }
++    }
++
++    fn is_leaves(&self, state: horizon_world::registry::BlockStateId) -> bool {
++        self.registry
++            .state(state)
++            .is_some_and(|s| s.name.ends_with("_leaves"))
++    }
++
+     /// Sets each column's biome to the mods' at `(x, surface, z)`.
+     fn remap(&self, columns: &mut [&mut horizon_client::lod::Column], at: &[(i32, i32)]) {
+         let blocks: Vec<[i32; 3]> = columns
+@@ -891,6 +955,7 @@ impl JavaLod {
+             }
+         }
+         self.tops(columns, at);
++        self.leaves(columns);
+     }
+ 
+     fn remap_one(
+@@ -917,6 +982,7 @@ impl LodSampler for JavaLod {
+             custom: self.custom.clone(),
+             registry: self.registry,
+             materials: self.materials.clone(),
++            foliage: self.foliage.clone(),
+             oracle: JavaBiomes {
+                 dimension: self.oracle.dimension.clone(),
+                 biomes: self.oracle.biomes.clone(),
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index 5ca6b943d5..5da6806332 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -1003,6 +1003,10 @@ public final class HorizonServer {
+         return HorizonWorldgen.lodMaterials(dimension);
+     }
+ 
++    public static String[] worldgenLodFoliage(String dimension) {
++        return HorizonWorldgen.lodFoliage(dimension);
++    }
++
+     public static String worldgenLodNoise(String dimension, String dir) {
+         return HorizonWorldgen.lodNoise(dimension, dir);
+     }
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+index 0002f2aea7..e4b2385243 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+@@ -793,6 +793,111 @@ public final class HorizonWorldgen {
+         return states.stream().map(net.minecraft.commands.arguments.blocks.BlockStateParser::serialize).toArray(String[]::new);
+     }
+ 
++    /**
++     * The leaves of each of the dimension's biomes' trees, "biome=state", the first tree a biome's
++     * features place (its weighted and random selectors walked too): far terrain's canopies come
++     * from Horizon's own trees, and take these in the mods' biomes (Biomes O' Plenty's fir and
++     * maple forests drew vanilla oak). A provider that needs the level (rare) is skipped. Null if
++     * the mods don't generate the dimension. (UMP, 2026-11-12)
++     */
++    public static String[] lodFoliage(String dimension) {
++        Thread.currentThread().setContextClassLoader(HorizonWorldgen.class.getClassLoader());
++        Dimension d = DIMENSIONS.get(dimension);
++        if (d == null) return null;
++        List<String> out = new ArrayList<>();
++        var random = net.minecraft.util.RandomSource.create(0);
++        for (var biome : d.generator.getBiomeSource().possibleBiomes()) {
++            var id = biome.unwrapKey().map(k -> k.identifier().toString()).orElse(null);
++            // Vanilla's biomes keep Horizon's own trees (vanilla's): only the mods' are asked.
++            if (id == null || id.startsWith("minecraft:")) continue;
++            // The leaves most of its trees have (a coniferous forest's firs, not the one poplar it
++            // also lists first).
++            java.util.Map<BlockState, Integer> counts = new java.util.HashMap<>();
++            for (var step : biome.value().getGenerationSettings().features()) {
++                for (var placed : step) treeLeaves(placed.value().getFeatures(), random, 0, counts);
++            }
++            counts.entrySet().stream().max(java.util.Map.Entry.comparingByValue()).ifPresent(e ->
++                    out.add(id + "=" + net.minecraft.commands.arguments.blocks.BlockStateParser.serialize(e.getKey())));
++        }
++        return out.toArray(String[]::new);
++    }
++
++    /**
++     * The leaves a feature of a mod's own type places, from its encoded form: the block of a
++     * field named like "foliage", else the first block id ending in "_leaves" (a configured
++     * feature's codec writes its providers as block states). Null for anything else.
++     */
++    private static BlockState ownTreeLeaves(Holder<net.minecraft.world.level.levelgen.feature.Feature> holder) {
++        var feature = holder.value();
++        if (feature.getClass().getName().startsWith("net.minecraft.")) return null;
++        try {
++            var ops = net.minecraft.resources.RegistryOps.create(com.mojang.serialization.JsonOps.INSTANCE,
++                    HorizonData.loaded.registries().compositeAccess());
++            var json = net.minecraft.world.level.levelgen.feature.Feature.DIRECT_CODEC.encodeStart(ops, feature).result().orElse(null);
++            if (json == null) return null;
++            String leaves = findLeaves(json, false);
++            if (leaves == null) return null;
++            var block = net.minecraft.core.registries.BuiltInRegistries.BLOCK.getOptional(net.minecraft.resources.Identifier.parse(leaves)).orElse(null);
++            return block == null ? null : block.defaultBlockState();
++        } catch (RuntimeException e) {
++            return null;
++        }
++    }
++
++    /** A leaves block id in {@code json}: under a "foliage" key first, else any "..._leaves". */
++    private static String findLeaves(com.google.gson.JsonElement json, boolean anyLeaves) {
++        if (json.isJsonObject()) {
++            var object = json.getAsJsonObject();
++            if (!anyLeaves) {
++                for (var entry : object.entrySet()) {
++                    if (entry.getKey().contains("foliage")) {
++                        String found = findLeaves(entry.getValue(), true);
++                        if (found != null) return found;
++                    }
++                }
++            }
++            for (var entry : object.entrySet()) {
++                String found = findLeaves(entry.getValue(), anyLeaves);
++                if (found != null) return found;
++            }
++        } else if (json.isJsonArray()) {
++            for (var element : json.getAsJsonArray()) {
++                String found = findLeaves(element, anyLeaves);
++                if (found != null) return found;
++            }
++        } else if (json.isJsonPrimitive() && json.getAsJsonPrimitive().isString()) {
++            String s = json.getAsString();
++            if (s.endsWith("_leaves") && s.contains(":")) return s;
++        }
++        return null;
++    }
++
++    /** Counts the leaves of every tree among {@code features} and their sub-features. */
++    private static void treeLeaves(java.util.stream.Stream<Holder<net.minecraft.world.level.levelgen.feature.Feature>> features,
++            net.minecraft.util.RandomSource random, int depth, java.util.Map<BlockState, Integer> counts) {
++        if (depth > 6) return;
++        for (var holder : (Iterable<Holder<net.minecraft.world.level.levelgen.feature.Feature>>) features::iterator) {
++            var feature = holder.value();
++            if (feature instanceof net.minecraft.world.level.levelgen.feature.TreeFeature tree) {
++                try {
++                    BlockState state = tree.foliageProvider().value().getState(null, random, BlockPos.ZERO);
++                    if (state != null && !state.isAir()) counts.merge(state, 1, Integer::sum);
++                } catch (RuntimeException e) {
++                    // A provider reading the level: not counted.
++                }
++                continue;
++            }
++            // A mod's own tree type (Biomes O' Plenty's taiga_tree): its saved form names its
++            // leaves (a "foliage" provider, or any leaves block it places).
++            BlockState own = ownTreeLeaves(holder);
++            if (own != null) {
++                counts.merge(own, 1, Integer::sum);
++                continue;
++            }
++            treeLeaves(feature.getSubFeatures(), random, depth + 1, counts);
++        }
++    }
++
+     /**
+      * Far terrain's noise for a dimension the mods generate: "vanilla" when its land is
+      * vanilla's noise (Horizon's own stands for it), "" when the mods' noise was written into
+diff --git a/crates/horizon-jvm/src/events.rs b/crates/horizon-jvm/src/events.rs
+index 37667d640d..419f94db85 100644
+--- a/crates/horizon-jvm/src/events.rs
++++ b/crates/horizon-jvm/src/events.rs
+@@ -2612,6 +2612,32 @@ pub fn worldgen_lod_materials(dimension: &str) -> Result<Option<Vec<String>>, St
+     Ok(names.flatten())
+ }
+ 
++/// Each biome's tree leaves, `(biome, state)` (`HorizonWorldgen.lodFoliage`): far canopies
++/// in the mods' biomes. None if the mods don't generate the dimension.
++pub fn worldgen_lod_foliage(dimension: &str) -> Result<Option<Vec<(String, String)>>, String> {
++    let pairs = with_server(|env, class| {
++        let dimension = env.new_string(dimension)?;
++        let pairs = env
++            .call_static_method(
++                class,
++                "worldgenLodFoliage",
++                "(Ljava/lang/String;)[Ljava/lang/String;",
++                &[JValue::Object(&dimension)],
++            )?
++            .l()?;
++        if pairs.is_null() {
++            return Ok(None);
++        }
++        string_array(env, pairs).map(Some)
++    })?;
++    Ok(pairs.flatten().map(|pairs| {
++        pairs
++            .into_iter()
++            .filter_map(|p| p.split_once('=').map(|(b, s)| (b.to_string(), s.to_string())))
++            .collect()
++    }))
++}
++
+ /// Far columns of a dimension a mod's own generator makes (`HorizonWorldgen.lodColumns`:
+ /// ChunkGenerator.getBaseColumn), each as runs from the bottom, `(from_y, to_y, state)` with
+ /// `to_y` exclusive. None if the mods don't generate the dimension.
+-- 
+2.56.0.windows.2
+

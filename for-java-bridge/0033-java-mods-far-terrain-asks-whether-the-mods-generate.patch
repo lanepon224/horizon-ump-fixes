@@ -1,0 +1,87 @@
+From ae596984d4ffcb89387af15e1333537df01ed6b2 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 33/90] java mods: far terrain asks whether the mods generate
+ the land before it samples
+
+JavaLod used the mods' noise land only once JavaTerrain::modded() was known, which only a chunk's generation asked; far tiles sampled before then (a saved world, a fast start) took vanilla's land and kept it. JavaLod now holds its JavaTerrain and asks it before its first sample. horizon-ctl's new lod-ground X Z tells what far terrain holds at a column (height, top block).
+
+UMP far_truth (far terrain's ground against the real world's top block every 64 blocks, 192-1536 ahead, 100 mods): mean height error 20.2 -> 6.5 blocks, median 13 -> 4. 75/75 tests.
+---
+ crates/horizon-client/src/game/control.rs       | 15 +++++++++++++++
+ crates/horizon-client/src/game/java_worldgen.rs | 12 ++++++++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/crates/horizon-client/src/game/control.rs b/crates/horizon-client/src/game/control.rs
+index 110627c7bc..848201c41f 100644
+--- a/crates/horizon-client/src/game/control.rs
++++ b/crates/horizon-client/src/game/control.rs
+@@ -875,6 +875,21 @@ impl Game<'_> {
+                 self.apply_settings();
+                 ok()
+             }
++            // What far terrain holds at a block column: its ground's height and block, from the
++            // finest tile sampled there (UMP's far-terrain fidelity test compares it with the world).
++            "lod-ground" => {
++                let x: i32 = arg(1)?.parse()?;
++                let z: i32 = arg(2)?.parse()?;
++                let found = self.lod.as_ref().and_then(|lod| lod.ground(x, z));
++                Ok(Some(match found {
++                    Some((height, state)) => json!({
++                        "ok": true,
++                        "height": height,
++                        "block": self.res.facts().get(state).name.to_string(),
++                    }),
++                    None => json!({"ok": true, "height": null}),
++                }))
++            }
+             "lod-distance" => {
+                 let n: u32 = arg(1)?.parse()?;
+                 if n > horizon_client::lod::MAX_CHUNKS {
+diff --git a/crates/horizon-client/src/game/java_worldgen.rs b/crates/horizon-client/src/game/java_worldgen.rs
+index fb3ff7f36b..37b8f70dc5 100644
+--- a/crates/horizon-client/src/game/java_worldgen.rs
++++ b/crates/horizon-client/src/game/java_worldgen.rs
+@@ -366,6 +366,7 @@ impl ChunkGenerator for JavaTerrain {
+     /// shape), with the mods' biomes once they generate the dimension.
+     fn lod_sampler(self: Arc<Self>) -> Box<dyn LodSampler> {
+         Box::new(JavaLod {
++            terrain: self.clone(),
+             inner: self.inner.clone().lod_sampler(),
+             land: self.land.clone(),
+             land_sampler: None,
+@@ -665,6 +666,8 @@ impl horizon_client::vanillagen::BiomeOracle for JavaBiomes {
+ /// mods' land) with each column's biome (its colours) and top block the mods' once they
+ /// generate it; a mod's own generator's base columns when it isn't on the noise.
+ struct JavaLod {
++    /// The generator it samples for: whether the mods generate the dimension is asked through it.
++    terrain: Arc<JavaTerrain>,
+     inner: Box<dyn LodSampler>,
+     /// The mods' noise's land, when they change it ([`NoiseLand`]), and its sampler.
+     land: Arc<NoiseLand>,
+@@ -685,6 +688,14 @@ impl JavaLod {
+ 
+     /// The sampler of the land's shape: the mods' noise's when they change it, else Horizon's.
+     fn land(&mut self) -> &mut Box<dyn LodSampler> {
++        // Until the mods say whether they generate the dimension (their worldgen starts beside
++        // the join), far terrain waits: a tile sampled before then took vanilla's land and kept
++        // it (UMP far_truth: 100 mods, far heights past 1 km were vanilla's, 20-50 blocks off).
++        // These are far terrain's own threads; nothing near waits on them. (UMP, 2026-11-12)
++        // Asked here when no chunk asked yet (a saved world's near chunks load from its save).
++        if self.modded.get().is_none() {
++            self.terrain.modded();
++        }
+         if self.land_sampler.is_none()
+             && self.modded()
+             && let Some(terrain) = self.land.terrain()
+@@ -898,6 +909,7 @@ impl JavaLod {
+ impl LodSampler for JavaLod {
+     fn fork(&self) -> Option<Box<dyn LodSampler>> {
+         Some(Box::new(JavaLod {
++            terrain: self.terrain.clone(),
+             inner: self.inner.fork()?,
+             land: self.land.clone(),
+             land_sampler: None,
+-- 
+2.56.0.windows.2
+

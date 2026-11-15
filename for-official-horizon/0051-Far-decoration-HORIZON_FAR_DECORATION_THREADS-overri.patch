@@ -1,0 +1,32 @@
+From 2073c1ed6d4a35ccb66ec235d80226b1a93de6da Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 51/90] Far decoration: HORIZON_FAR_DECORATION_THREADS
+ overrides its thread count (speed tests)
+
+UMP: at LOD 256 with no mods, 4 threads give 14/46/70% of the near far columns real trees at 15/30/60 s, 10 threads 17/53/77%: the machine's cores (7.2 busy) are the limit, not the thread count.
+---
+ crates/horizon-client/src/vanillagen/lod.rs | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client/src/vanillagen/lod.rs b/crates/horizon-client/src/vanillagen/lod.rs
+index 2213f97461..d20b550944 100644
+--- a/crates/horizon-client/src/vanillagen/lod.rs
++++ b/crates/horizon-client/src/vanillagen/lod.rs
+@@ -72,7 +72,12 @@ impl Builder {
+         // ticks and the frame leave, so more cores can share it: a third of
+         // the threads, rounded up (a 4-thread machine's one thread left idle
+         // time while the far trees and structures came in).
+-        let count = horizon_threads::worker_count().div_ceil(3).clamp(1, 12);
++        // HORIZON_FAR_DECORATION_THREADS overrides it (A/B speed tests).
++        let count = std::env::var("HORIZON_FAR_DECORATION_THREADS")
++            .ok()
++            .and_then(|v| v.parse::<usize>().ok())
++            .unwrap_or_else(|| horizon_threads::worker_count().div_ceil(3))
++            .clamp(1, 12);
+         let threads = (0..count)
+             .map(|_| Self::spawn(terrain.clone(), shared.clone(), tx.clone()))
+             .collect();
+-- 
+2.56.0.windows.2
+

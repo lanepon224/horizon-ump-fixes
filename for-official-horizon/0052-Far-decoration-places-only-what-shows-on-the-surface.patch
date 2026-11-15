@@ -1,0 +1,101 @@
+From f090fbb74ae2ce9ada282a977e91bc0824e109f0 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 52/90] Far decoration places only what shows on the surface
+
+Far terrain's speculative chunks (never saved or played in) skipped nothing: ores, underground decoration, fluid springs and strongholds ran for every far chunk. GeneratorWorker::set_surface_only skips those steps; the far decoration threads set it (HORIZON_FAR_DECORATION_FULL=1 keeps them all).
+
+UMP (far_detail_fill.ps1, no mods, LOD 256): far columns with real trees at 15/30/60 s 14/46/70% -> 25/55/74%.
+---
+ crates/horizon-client/src/vanillagen/lod.rs           |  3 +++
+ crates/horizon-world/src/worldgen/generator.rs        | 11 +++++++++++
+ .../src/worldgen/generator_decoration.rs              |  9 +++++++++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/crates/horizon-client/src/vanillagen/lod.rs b/crates/horizon-client/src/vanillagen/lod.rs
+index d20b550944..92a43291c4 100644
+--- a/crates/horizon-client/src/vanillagen/lod.rs
++++ b/crates/horizon-client/src/vanillagen/lod.rs
+@@ -118,6 +118,9 @@ impl Builder {
+                     }
+                 };
+                 let mut state = generator.worker();
++                // Only what shows from afar: no ores, underground decoration or springs.
++                // HORIZON_FAR_DECORATION_FULL=1 keeps every step (A/B checks).
++                state.set_surface_only(std::env::var("HORIZON_FAR_DECORATION_FULL").as_deref() != Ok("1"));
+                 loop {
+                     let key = {
+                         let mut requests = worker.requests.lock().unwrap();
+diff --git a/crates/horizon-world/src/worldgen/generator.rs b/crates/horizon-world/src/worldgen/generator.rs
+index 3f58ed18e9..e04d6b87c6 100644
+--- a/crates/horizon-world/src/worldgen/generator.rs
++++ b/crates/horizon-world/src/worldgen/generator.rs
+@@ -2404,6 +2404,9 @@ pub(super) struct WorkerState {
+     heights: HashMap<(i32, i32, u8), i32>,
+     /// Decorate with structure pieces only (for structure parity checks).
+     pub(super) structures_only: bool,
++    /// Skip the steps whose features can't be seen from the surface: ores, underground
++    /// decoration, fluid springs, strongholds (far terrain's speculative decoration).
++    pub(super) surface_only: bool,
+     pub(super) structure_mobs: Option<Arc<dyn StructureMobs>>,
+     /// The world's surface rule compiled once for this worker's chunks: a
+     /// `CompiledSurfaceRule` of the pipeline's random.
+@@ -3689,6 +3692,7 @@ impl OverworldGenerator {
+                 structure_biomes: HashMap::new(),
+                 timings: StageTimings::default(),
+                 structures_only: false,
++                surface_only: false,
+                 structure_mobs: None,
+                 heights: HashMap::new(),
+                 surface_rule: None,
+@@ -3854,6 +3858,13 @@ impl GeneratorWorker {
+     pub fn set_structures_only(&mut self, only: bool) {
+         self.state.structures_only = only;
+     }
++    /// Decorate for the look of the surface only: the steps under it (ores, underground
++    /// decoration, fluid springs, strongholds) are skipped. Far terrain's speculative chunks
++    /// (never saved, never played in) take only what is seen from afar: trees, lakes, snow,
++    /// surface structures. (UMP, 2026-11-13)
++    pub fn set_surface_only(&mut self, only: bool) {
++        self.state.surface_only = only;
++    }
+     pub fn set_structure_mobs(&mut self, mobs: Arc<dyn StructureMobs>) {
+         self.state.structure_mobs = Some(mobs);
+     }
+diff --git a/crates/horizon-world/src/worldgen/generator_decoration.rs b/crates/horizon-world/src/worldgen/generator_decoration.rs
+index cba2bb91f2..0dff44a522 100644
+--- a/crates/horizon-world/src/worldgen/generator_decoration.rs
++++ b/crates/horizon-world/src/worldgen/generator_decoration.rs
+@@ -326,6 +326,11 @@ impl Decoration {
+             })
+             .clone()
+     }
++    /// Whether a feature's step shows on the surface (`WorkerState::surface_only`): all but
++    /// strongholds, underground ores, underground decoration and fluid springs.
++    fn surface_feature(&self, id: FeatureIdentity) -> bool {
++        !matches!(self.plan.seed(id).map(|(_index, step)| step), Some(5..=8))
++    }
+     /// Vanilla's feature identity and the step-local index/step mixed into
+     /// `set_feature_seed`.
+     pub(super) fn seed(&self, name: &str) -> Option<(u32, i32, i32)> {
+@@ -437,6 +442,7 @@ impl Decoration {
+             Err(e) => return Err(resource(e.to_string())),
+         };
+         let structures_only = worker.structures_only;
++        let surface_only = worker.surface_only;
+         let references = region[4].structure_starts.clone();
+         let mut block_entities = Vec::new();
+         for chunk in region.iter_mut() {
+@@ -529,6 +535,9 @@ impl Decoration {
+                 if structures_only {
+                     return Ok(false);
+                 }
++                if surface_only && !self.surface_feature(id) {
++                    return Ok(false);
++                }
+                 let Ok(feature) = &self.features[id.0 as usize] else {
+                     stats.unsupported += 1;
+                     stats.skipped.insert(self.names[id.0 as usize].clone());
+-- 
+2.56.0.windows.2
+

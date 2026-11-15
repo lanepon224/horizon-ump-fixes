@@ -1,0 +1,63 @@
+From d5b4573eebf4bab99377b612e832d6434401b3d6 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 38/90] java mods: the client's levels have the level
+ extractor; a block entity's failed update is said once
+
+Client levels are made without their constructor and had no level extractor (26.3's level renderer), so a mod's client block entity that changes its block on the client (Yuushya's) threw NullPointerException every tick: 913 log lines a second, 100 MB of log in minutes in UMP's weekly check. They now share the client's (whose redraws do nothing: LevelExtractorMixin). A block entity whose update still fails is said once, with its type.
+
+UMP: 73/75 then 75/75 (the UX test's two failures were its placement behind a hill, fixed in the test).
+---
+ .../dev/horizonlab/platform/HorizonClient.java    |  5 +++++
+ .../platform/HorizonClientBlockEntities.java      | 15 ++++++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index cb7d727f05..5f354f721c 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -3427,6 +3427,11 @@ public final class HorizonClient {
+                 // Its tick rate (ClientboundTickingStatePacket's): the server's (potions'
+                 // tooltips read it for their durations; JEI's search reads every tooltip).
+                 set(owner, level, "tickRateManager", server.tickRateManager());
++                // Its level extractor (the renderer the constructor gives it): the client's, which
++                // Horizon's draw stands in for (LevelExtractorMixin: nothing to redraw). Without it
++                // every block change a mod's block entity makes on the client (Yuushya's, Supplementaries')
++                // threw, every tick. (UMP, 2026-11-12)
++                set(owner, level, "levelExtractor", minecraft.levelExtractor);
+                 // Its chunk source (mods ask it for the light engine: Xaero's World Map), its
+                 // light Horizon's as the level's own (LevelMixin).
+                 try {
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClientBlockEntities.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClientBlockEntities.java
+index 6b1c668ff4..847d1107bc 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClientBlockEntities.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClientBlockEntities.java
+@@ -330,11 +330,24 @@ public final class HorizonClientBlockEntities {
+         }
+     }
+ 
++    /**
++     * Block entities whose update failed to load, said once each: one that fails does so every tick it
++     * changes (a mod's block entity reading a client part Horizon's client lacks), and said each time it
++     * wrote 900 lines a second, 100 MB of log in minutes, with its formatting the game's time. (UMP, 2026-11-12)
++     */
++    private static final java.util.Set<BlockEntity> FAILED_LOADS =
++            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<>());
++
+     private static void load(ClientLevel level, BlockEntity be, CompoundTag tag) {
+         try {
+             be.loadWithComponents(TagValueInput.create(ProblemReporter.DISCARDING, level.registryAccess(), tag));
++            FAILED_LOADS.remove(be);
+         } catch (Throwable t) {
+-            Natives.log("Horizon's client: the client's block entity at " + be.getBlockPos() + " couldn't load its update: " + t);
++            if (FAILED_LOADS.add(be)) {
++                Natives.log("Horizon's client: the client's block entity at " + be.getBlockPos() + " ("
++                        + net.minecraft.core.registries.BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(be.getType())
++                        + ") couldn't load its update (said once): " + t);
++            }
+         }
+     }
+ }
+-- 
+2.56.0.windows.2
+

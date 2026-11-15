@@ -1,0 +1,153 @@
+From 7c3bc345ce3d4ee4ae1f68b232025ec63c981fe6 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 70/90] Remember Shapes.joinIsNotEmpty answers by shape
+ identity
+
+Block registration asks joinIsNotEmpty for every state's faces and support types (BlockStateBase.Cache), with the same immutable shape objects shared by many states: with 184 mods (826,000 states) it was most of the mods' start. Its answers are kept by the identity of the two shapes and the operation (bounded, 2M entries; HORIZON_SHAPE_MEMO=0 turns it off). Same answers, same order, same threads: nothing a mod sees changes.
+
+UMP, 184 mods warm: remembered 11.07M of 11.93M calls; main entrypoints 26-28 s -> 20-22 s; ready 88-97 -> 84-88 s, join 43-48 s.
+---
+ .../horizonlab/bridge/fabric/FabricBoot.java  |  5 ++
+ .../horizonlab/platform/HorizonShapeMemo.java | 59 +++++++++++++++++++
+ .../platform/mixin/ShapesJoinMixin.java       | 33 +++++++++++
+ .../platform/horizon-platform.mixins.json     |  1 +
+ 4 files changed, 98 insertions(+)
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
+
+diff --git a/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java b/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
+index d182d5f2ed..a315d97088 100644
+--- a/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
++++ b/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
+@@ -106,6 +106,11 @@ public final class FabricBoot {
+             }
+             throw e;
+         }
++        try {
++            Class.forName("dev.horizonlab.platform.HorizonShapeMemo", true, gameLoader).getMethod("report").invoke(null);
++        } catch (ReflectiveOperationException e) {
++            // No platform mod.
++        }
+         if (env == EnvType.CLIENT) {
+             // Every client entrypoint runs, then Fabric throws what failed: a mod whose client
+             // code needs more of a client than the headless one has loses that, not the rest.
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
+new file mode 100644
+index 0000000000..deb7527e74
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
+@@ -0,0 +1,59 @@
++package dev.horizonlab.platform;
++
++import dev.horizonlab.bridge.Natives;
++import net.minecraft.world.phys.shapes.BooleanOp;
++import net.minecraft.world.phys.shapes.VoxelShape;
++
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.LongAdder;
++
++/**
++ * Remembered answers of Shapes.joinIsNotEmpty by the identity of its two shapes and its operation
++ * (mixin.ShapesJoinMixin). Shapes are immutable, so the same objects always give the same answer;
++ * keys hold the shapes, which their block states hold anyway. Bounded: past MAX entries it starts
++ * over. HORIZON_SHAPE_MEMO=0 turns it off. (UMP, 2026-11-14)
++ */
++public final class HorizonShapeMemo {
++    private HorizonShapeMemo() {}
++
++    private static final boolean ON = !"0".equals(System.getenv("HORIZON_SHAPE_MEMO"));
++    private static final int MAX = 2_000_000;
++    private static final ConcurrentHashMap<Key, Boolean> MEMO = new ConcurrentHashMap<>();
++    private static final LongAdder HITS = new LongAdder();
++    private static final LongAdder MISSES = new LongAdder();
++
++    private record Key(VoxelShape first, VoxelShape second, BooleanOp op) {
++        @Override
++        public boolean equals(Object o) {
++            return o instanceof Key k && k.first == first && k.second == second && k.op == op;
++        }
++
++        @Override
++        public int hashCode() {
++            return (System.identityHashCode(first) * 31 + System.identityHashCode(second)) * 31 + System.identityHashCode(op);
++        }
++    }
++
++    public static Boolean get(VoxelShape first, VoxelShape second, BooleanOp op) {
++        if (!ON) return null;
++        Boolean known = MEMO.get(new Key(first, second, op));
++        if (known != null) HITS.increment();
++        else MISSES.increment();
++        return known;
++    }
++
++    public static void put(VoxelShape first, VoxelShape second, BooleanOp op, boolean value) {
++        if (!ON) return;
++        if (MEMO.size() >= MAX) MEMO.clear();
++        MEMO.put(new Key(first, second, op), value);
++    }
++
++    /** One line: how often the memory answered (called after the mods' entrypoints). */
++    public static void report() {
++        long hits = HITS.sum(), misses = MISSES.sum();
++        if (hits + misses > 0) {
++            Natives.log("Java mods: shape joins remembered " + hits + " of " + (hits + misses)
++                    + " times; " + MEMO.size() + " kept");
++        }
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
+new file mode 100644
+index 0000000000..4448b0af61
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
+@@ -0,0 +1,33 @@
++package dev.horizonlab.platform.mixin;
++
++import dev.horizonlab.platform.HorizonShapeMemo;
++import net.minecraft.world.phys.shapes.BooleanOp;
++import net.minecraft.world.phys.shapes.Shapes;
++import net.minecraft.world.phys.shapes.VoxelShape;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * Shapes.joinIsNotEmpty answered from memory for the same two shapes and operation. It is a pure
++ * function of immutable shapes, and block registration asks it for every state's faces and support
++ * types (BlockStateBase.Cache: 18 a state), with the same shape objects shared by many states: with
++ * 184 mods, 826,000 states, it was most of the mods' start (UMP startup samples).
++ * See {@link HorizonShapeMemo}. (UMP, 2026-11-14)
++ */
++@Mixin(Shapes.class)
++public abstract class ShapesJoinMixin {
++    @Inject(method = "joinIsNotEmpty(Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/BooleanOp;)Z",
++            at = @At("HEAD"), cancellable = true)
++    private static void horizon$remembered(VoxelShape first, VoxelShape second, BooleanOp op, CallbackInfoReturnable<Boolean> info) {
++        Boolean known = HorizonShapeMemo.get(first, second, op);
++        if (known != null) info.setReturnValue(known);
++    }
++
++    @Inject(method = "joinIsNotEmpty(Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/BooleanOp;)Z",
++            at = @At("RETURN"))
++    private static void horizon$remember(VoxelShape first, VoxelShape second, BooleanOp op, CallbackInfoReturnable<Boolean> info) {
++        HorizonShapeMemo.put(first, second, op, info.getReturnValueZ());
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+index df4391b769..dd4a2e8d0a 100644
+--- a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
++++ b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+@@ -7,6 +7,7 @@
+     "EntityAccess",
+     "TemplateCacheMixin",
+     "TemplatePaletteMixin",
++    "ShapesJoinMixin",
+     "ServerCommonListenerAccess",
+     "PlayerListAccess",
+     "MinecraftServerAccess",
+-- 
+2.56.0.windows.2
+

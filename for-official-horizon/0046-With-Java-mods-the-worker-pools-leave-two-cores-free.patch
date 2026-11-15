@@ -1,0 +1,68 @@
+From 0269fac6d209b6dde2b7ca09a588e7f1a8278cad Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 46/90] With Java mods, the worker pools leave two cores free
+
+Java mods' world generation runs on the worker pools, with the mods' own threads beside them: while new land generated every core stayed busy and the render thread waited for one (slow frames of 14 ms wall for 4 ms of work). horizon_threads::spare_cores(n), called before any pool starts, takes n cores off worker_count on machines of 8 or more; the game spares 2 when Java mods are installed. HORIZON_WORKER_THREADS still wins.
+
+UMP perf_test, 300-mod pack, fresh world, LOD 512: flying 1% low 42-46 fps -> 71, worst frame 60-80 ms -> 25 ms; averages and far terrain's fill unchanged. 75/75 tests.
+---
+ crates/horizon-client/src/game.rs |  6 ++++++
+ crates/horizon-threads/src/lib.rs | 21 +++++++++++++++++++--
+ 2 files changed, 25 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index b67dfc3993..371c07eceb 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -22264,6 +22264,12 @@ pub fn run_with() -> Result<()> {
+     // Before any worker starts: on Linux they go behind the server thread
+     // and the render thread.
+     horizon_threads::put_helpers_behind();
++    // Java mods' world generation and threads beside the worker pools: two cores kept for the
++    // frame and the tick (horizon_threads::spare_cores).
++    #[cfg(feature = "java-mods")]
++    if !java_mods::mod_jars().1.is_empty() {
++        horizon_threads::spare_cores(2);
++    }
+     if options.execution_role.is_client() {
+         // The render thread, like the server thread, ahead of the workers on
+         // macOS and Windows. While terrain loads, the workers
+diff --git a/crates/horizon-threads/src/lib.rs b/crates/horizon-threads/src/lib.rs
+index 5877f88afa..894b943058 100644
+--- a/crates/horizon-threads/src/lib.rs
++++ b/crates/horizon-threads/src/lib.rs
+@@ -26,11 +26,28 @@ use std::sync::{
+ pub fn worker_count() -> usize {
+     static COUNT: OnceLock<usize> = OnceLock::new();
+     *COUNT.get_or_init(|| {
+-        parse_worker_count(std::env::var("HORIZON_WORKER_THREADS").ok())
+-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
++        parse_worker_count(std::env::var("HORIZON_WORKER_THREADS").ok()).unwrap_or_else(|| {
++            let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
++            machine.saturating_sub(SPARED.load(Ordering::Relaxed)).max(1)
++        })
+     })
+ }
+ 
++/// Cores the worker pools leave free (`spare_cores`).
++static SPARED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// Before any pool starts: the worker pools leave `cores` of the machine's free (on one of 8
++/// or more), for the threads a frame and a tick wait on. With Java mods, whose world generation
++/// runs on the workers and the mods' own threads beside them, every core stayed busy while new
++/// land generated and the render thread waited for one: UMP's 300-mod flight, 4 runs, 1% low
++/// 42-46 fps with all 12 cores' workers, 65-69 with 10; averages and far terrain's fill the
++/// same. A count `HORIZON_WORKER_THREADS` sets wins. (UMP, 2026-11-13)
++pub fn spare_cores(cores: usize) {
++    if std::thread::available_parallelism().map_or(1, |n| n.get()) >= 8 {
++        SPARED.store(cores, Ordering::Relaxed);
++    }
++}
++
+ /// `Some(n)` when `value` names a positive count (`" 4 "` counts; `"0"`,
+ /// `"lots"`, a missing variable don't).
+ fn parse_worker_count(value: Option<String>) -> Option<usize> {
+-- 
+2.56.0.windows.2
+

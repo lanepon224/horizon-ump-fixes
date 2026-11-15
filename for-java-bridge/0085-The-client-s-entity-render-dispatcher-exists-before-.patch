@@ -1,0 +1,55 @@
+From 0c947d9f8c5de765a7d530a87f14ae128263a6c4 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 85/90] The client's entity render dispatcher exists before its
+ resource reload
+
+Minecraft's constructor makes its EntityRenderDispatcher before the first resource reload; the mirror made it on the first entity drawn, after. Mods' reload listeners that read it (Kiwi's: getEntityRenderDispatcher().getPlayerRenderers()) failed alone and again with the models. HorizonEntityRender.dispatcher() makes it (with the players' renderers) before the mods' client reload.
+
+UMP 184 mods: Kiwi's reload listener runs (17 of the mods' reload listeners ran, was 16 with Kiwi failing twice).
+---
+ .../dev/horizonlab/platform/HorizonClient.java     |  2 ++
+ .../horizonlab/platform/HorizonEntityRender.java   | 14 ++++++++++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index 74becb107b..efd6931614 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -2749,6 +2749,8 @@ public final class HorizonClient {
+                 Natives.log("Horizon's client: the GPU's shaders couldn't be loaded: " + t);
+             }
+         }
++        // The entity render dispatcher, which Minecraft's constructor makes before this reload.
++        HorizonEntityRender.dispatcher();
+         java.util.concurrent.Executor here = Runnable::run;
+         int ran = 0;
+         int skipped = 0;
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonEntityRender.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonEntityRender.java
+index f2a85ed756..5c51cd165e 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonEntityRender.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonEntityRender.java
+@@ -126,6 +126,20 @@ public final class HorizonEntityRender {
+         return context;
+     }
+ 
++    /**
++     * The client's entity render dispatcher (Minecraft.getEntityRenderDispatcher) made now, as
++     * Minecraft's constructor makes it before its first resource reload: mods' reload listeners
++     * read it (Kiwi's player renderers: getEntityRenderDispatcher().getPlayerRenderers() was null,
++     * and its reload failed). (UMP, 2026-11-15)
++     */
++    static void dispatcher() {
++        try {
++            context();
++        } catch (Throwable t) {
++            Natives.log("Java mods: the client's entity renderers couldn't be made before its reload: " + t);
++        }
++    }
++
+     /**
+      * The client's models are in (HorizonClient.finishModels): the renderers' contexts are made
+      * again with its block models, and renderers that failed for want of them are tried again.
+-- 
+2.56.0.windows.2
+

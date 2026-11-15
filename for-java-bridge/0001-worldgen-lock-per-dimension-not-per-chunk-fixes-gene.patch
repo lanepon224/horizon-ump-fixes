@@ -1,0 +1,30 @@
+From bd98ce35448720aa736acaf2aa92843bc5dd4733 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 01/90] worldgen: lock per dimension, not per chunk (fixes
+ generation deadlock)
+
+Threads each held one ProtoChunk while advancing it and waited for a neighbour another thread held. A thread dump showed 4+ worker threads BLOCKED in HorizonWorldgen.advance in a cycle; with a large mod pack the world never finished loading. The lock is reentrant, so a step that advances its neighbours still works. Verified: 21-mod pack 3/3 starts after (world joined in 4-9 s).
+---
+ .../platform/dev/horizonlab/platform/HorizonWorldgen.java    | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+index 69b4b6c2c9..ec628aa345 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+@@ -1080,7 +1080,10 @@ public final class HorizonWorldgen {
+         for (ChunkStatus status : STEPS) {
+             if (status.isAfter(target)) break;
+             if (chunk.getPersistedStatus().isOrAfter(status)) continue;
+-            synchronized (chunk) {
++            // UMP patch 2026-11-10: one lock per dimension instead of per chunk. Per-chunk locks deadlocked under
++            // parallel generation: each thread held one chunk and waited for a neighbour another held (see
++            // ump/poc/hang/threads.txt). The lock is reentrant, so a step that advances its neighbours still works.
++            synchronized (d) {
+                 if (chunk.getPersistedStatus().isOrAfter(status)) continue;
+                 ChunkStep step = ChunkPyramid.GENERATION_PYRAMID.getStepTo(status);
+                 long started = HorizonProfile.start();
+-- 
+2.56.0.windows.2
+

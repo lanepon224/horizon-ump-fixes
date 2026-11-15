@@ -1,0 +1,246 @@
+From f1c3219e729ddb0c64ff296e336fe88d40185966 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 55/90] Faster starts with big mod packs: blockstates, mods'
+ content and item definitions read by several threads
+
+Binding the block models read each block's blockstate file in turn (the definitions of 880k states for 184 mods: 107 s); they are read up front by par_map. content_root read every mod's package and walked its folder one mod at a time (60 s for 200k files): several threads now, accepted in the same order. Item definitions were read one namespace at a time (hundreds with mods): all at once. Startup trace steps content.java_content, content.read_mods, content.resource_root and core.bake_states.bind/resolve/bake show where the content and model time goes.
+
+UMP, 184 mods, warm start on an SSD: ready 438 -> 280 s (block models 114 -> 26 s, item models 39 -> 15 s, content read before the core tables 86 -> 42 s).
+---
+ .../src/models/catalog.rs                     | 21 ++++--
+ crates/horizon-client/src/game/mods.rs        | 65 ++++++++++++++-----
+ crates/horizon-client/src/item_render.rs      | 60 +++++++++++++----
+ 3 files changed, 111 insertions(+), 35 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/models/catalog.rs b/crates/horizon-client-render/src/models/catalog.rs
+index 727c9e4967..ab6fbb1330 100644
+--- a/crates/horizon-client-render/src/models/catalog.rs
++++ b/crates/horizon-client-render/src/models/catalog.rs
+@@ -196,7 +196,18 @@ impl StateModels {
+                 by_name.entry(state.name.as_str()).or_default().push(id);
+             }
+         }
+-        for block in blocks.iter().copied().collect::<BTreeSet<_>>() {
++        let bind_step = crate::spans::startup::step("core.bake_states.bind");
++        let ordered: Vec<&str> = blocks.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
++        // Every block's blockstate file read up front, by several threads: a modded pack's tens
++        // of thousands of separate files, read one at a time in the loop below, took most of
++        // this step (minutes). (UMP, 2026-11-14)
++        let definition_texts: Vec<std::io::Result<String>> = crate::par::par_map(&ordered, |block| {
++            let (namespace, path) = block.split_once(':').unwrap_or(("minecraft", block));
++            horizon_core::prepared_files::read_to_string(
++                &root.join(format!("assets/{namespace}/blockstates/{path}.json")),
++            )
++        });
++        for (block, definition_text) in ordered.iter().copied().zip(definition_texts) {
+             // Vanilla blocks come bare; content mods' blocks with their namespace.
+             let (namespace, path) = block.split_once(':').unwrap_or(("minecraft", block));
+             let name = format!("{namespace}:{path}");
+@@ -242,9 +253,7 @@ impl StateModels {
+             // gets no model, and the other blocks still load. A file several
+             // packs provide binds each pack's definition on its own, bottom
+             // first (`loadBlockStateDefinitionStack`).
+-            let layers = match horizon_core::prepared_files::read_to_string(
+-                &root.join(format!("assets/{namespace}/blockstates/{path}.json")),
+-            )
++            let layers = match definition_text
+             .map_err(|e| e.to_string())
+             .and_then(|text| definition_layers(&text))
+             {
+@@ -324,6 +333,8 @@ impl StateModels {
+                 choices.push(CompiledChoices::new(&definition)?);
+             }
+         }
++        drop(bind_step);
++        let resolve_step = crate::spans::startup::step("core.bake_states.resolve");
+         let names: Vec<String> = variants.iter().map(|(name, _, _)| name.clone()).collect();
+         let library = match models.block_library(root, names.clone()) {
+             Ok(library) => library,
+@@ -346,6 +357,8 @@ impl StateModels {
+                 .flat_map(|model| model.textures.values())
+                 .map(|material| material.sprite.as_str()),
+         );
++        drop(resolve_step);
++        let _bake_step = crate::spans::startup::step("core.bake_states.bake");
+         let mut baked = Vec::with_capacity(variants.len());
+         let mut index = BTreeMap::new();
+         for ((name, turns, lock), model) in variants.into_iter().zip(resolved) {
+diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
+index a93c918b9f..4cfd0be3c2 100644
+--- a/crates/horizon-client/src/game/mods.rs
++++ b/crates/horizon-client/src/game/mods.rs
+@@ -82,7 +82,8 @@ pub(super) fn content_root(
+     let here = std::env::current_dir().unwrap_or_default();
+     // The Java mods' content mods are always on, as dev mods are (the jars in mods-java/ are
+     // what turns them on and off).
+-    let dev = &[dev, super::java_mods::java_content(root).as_slice()].concat();
++    let java = horizon_client::spans::startup::time("content.java_content", || super::java_mods::java_content(root));
++    let dev = &[dev, java.as_slice()].concat();
+     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
+     paths.retain(|p| !dev.contains(p));
+     paths.extend(dev.iter().cloned());
+@@ -91,26 +92,54 @@ pub(super) fn content_root(
+     // The first load's list stays (`set_local`): a reload does not hash the files again.
+     let announce = !horizon_protocol::mod_list::is_set();
+     let mut announced = Vec::new();
+-    for path in &paths {
+-        let Ok(package) = Package::read(path) else {
++    // Every mod's package and content read up front, by several threads: walking a big pack's
++    // mod folders (200k files for 184 mods) one mod at a time took most of a minute of each
++    // start. Accepted below in the same order as before. (UMP, 2026-11-14)
++    let read: Vec<Option<(Package, Result<Content, String>)>> = {
++        let paths_ref = &paths;
++        let next = std::sync::atomic::AtomicUsize::new(0);
++        let slots: Vec<std::sync::Mutex<Option<(Package, Result<Content, String>)>>> =
++            paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
++        let threads = horizon_threads::worker_count().clamp(1, 12);
++        std::thread::scope(|scope| {
++            for _ in 0..threads {
++                scope.spawn(|| loop {
++                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                    let Some(path) = paths_ref.get(i) else {
++                        return;
++                    };
++                    let Ok(package) = Package::read(path) else {
++                        continue;
++                    };
++                    let m = &package.manifest;
++                    let on = enabled.contains(&m.id) || dev.contains(path);
++                    if !on || !m.capabilities.contains(&Capability::Registries) {
++                        continue;
++                    }
++                    let declared: Vec<String> = native_declared()
++                        .1
++                        .iter()
++                        .filter(|i| i.id.split_once(':').is_some_and(|(ns, _)| ns == m.id))
++                        .map(|i| i.id.clone())
++                        .collect();
++                    let content = horizon_client::spans::startup::time("content.read_mods", || {
++                        Content::read_declaring(path, m, &declared)
++                    });
++                    *slots[i].lock().unwrap() = Some((package, content));
++                });
++            }
++        });
++        slots.into_iter().map(|s| s.into_inner().unwrap()).collect()
++    };
++    for (path, read) in paths.iter().zip(read) {
++        let Some((package, content)) = read else {
+             continue;
+         };
+         let m = &package.manifest;
+-        let on = enabled.contains(&m.id) || dev.contains(path);
+-        if !on
+-            || !m.capabilities.contains(&Capability::Registries)
+-            || mods.iter().any(|c| c.id == m.id)
+-        {
++        if mods.iter().any(|c| c.id == m.id) {
+             continue;
+         }
+-        // The items this mod's native code declares may be a file item's crafting remainder.
+-        let declared: Vec<String> = native_declared()
+-            .1
+-            .iter()
+-            .filter(|i| i.id.split_once(':').is_some_and(|(ns, _)| ns == m.id))
+-            .map(|i| i.id.clone())
+-            .collect();
+-        let content = match Content::read_declaring(path, m, &declared) {
++        let content = match content {
+             Ok(content) => content,
+             Err(e) => {
+                 log::warn!("Horizon: mod {} content not loaded: {e}", m.id);
+@@ -157,7 +186,9 @@ pub(super) fn content_root(
+             }
+         }
+     }
+-    let built = mod_content::resource_root(root, &mods, &horizon_cache());
++    let built = horizon_client::spans::startup::time("content.resource_root", || {
++        mod_content::resource_root(root, &mods, &horizon_cache())
++    });
+     super::java_mods::start_early();
+     match built {
+         Ok(out) => {
+diff --git a/crates/horizon-client/src/item_render.rs b/crates/horizon-client/src/item_render.rs
+index 9b6ea9939d..d92c21cd21 100644
+--- a/crates/horizon-client/src/item_render.rs
++++ b/crates/horizon-client/src/item_render.rs
+@@ -678,29 +678,61 @@ fn load_definitions(root: &Path) -> BTreeMap<String, ClientItem> {
+     let Ok(namespaces) = fs::read_dir(root.join("assets")) else {
+         return out;
+     };
+-    for ns in namespaces.flatten() {
+-        let Ok(folder) = horizon_world::json_folder::read(&ns.path().join("items")) else {
+-            continue;
+-        };
++    // Every namespace's folder read and parsed at once: a modded pack has hundreds, each read
++    // in turn took tens of seconds of a start. Inserted in the same order. (UMP, 2026-11-14)
++    let namespaces: Vec<_> = namespaces.flatten().collect();
++    let parsed = par_map(&namespaces, |ns| {
++        let folder = horizon_world::json_folder::read(&ns.path().join("items")).ok()?;
+         let namespace = ns.file_name().to_string_lossy().into_owned();
+-        for file in &folder.files {
+-            let Some(text) = file.bytes().ok().and_then(|b| std::str::from_utf8(b).ok()) else {
+-                continue;
+-            };
+-            match ClientItem::from_json(text) {
++        let items: Vec<(String, Result<ClientItem, String>)> = folder
++            .files
++            .iter()
++            .filter_map(|file| {
++                let text = file.bytes().ok().and_then(|b| std::str::from_utf8(b).ok())?;
++                Some((file.name.clone(), ClientItem::from_json(text).map_err(|e| e.to_string())))
++            })
++            .collect();
++        Some((namespace, items))
++    });
++    for (namespace, items) in parsed.into_iter().flatten() {
++        for (name, item) in items {
++            match item {
+                 Ok(item) => {
+-                    out.insert(format!("{namespace}:{}", file.name), item);
++                    out.insert(format!("{namespace}:{name}"), item);
+                 }
+-                Err(e) => log::warn!(
+-                    "Horizon: item definition {namespace}:{} not loaded: {e}",
+-                    file.name
+-                ),
++                Err(e) => log::warn!("Horizon: item definition {namespace}:{name} not loaded: {e}"),
+             }
+         }
+     }
+     out
+ }
+ 
++/// `f` over `items` on several threads, results in order.
++fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
++    let next = std::sync::atomic::AtomicUsize::new(0);
++    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
++    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12);
++    std::thread::scope(|scope| {
++        for _ in 0..threads {
++            scope.spawn(|| loop {
++                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                let Some(item) = items.get(i) else {
++                    return;
++                };
++                *slots[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(f(item));
++            });
++        }
++    });
++    slots
++        .into_iter()
++        .map(|s| {
++            s.into_inner()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .expect("every item mapped")
++        })
++        .collect()
++}
++
+ fn glint_padding(filtering: i32, bit: i32) -> usize {
+     if filtering == 2 {
+         bit.wrapping_sub(1).clamp(0, 4) as usize
+-- 
+2.56.0.windows.2
+

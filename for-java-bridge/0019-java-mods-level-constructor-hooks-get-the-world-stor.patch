@@ -1,0 +1,86 @@
+From eb4fec15098df1bd3e00a84e1764e0fc94ecb64a Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 19/90] java mods: level constructor hooks get the world
+ storage
+
+ServerLevel's constructor hooks (fired for mirrored levels and the mods' own levels) got null for LevelStorageAccess; BCLib's onServerWorldInit (BetterEnd, BetterNether's library) reads its level id and failed for every level. They now get the bridge's own storage beside Horizon's world (one a process, as the server start's), also when resolved by parameter type. UMP 100-mod gap run: 0 BCLib failures (4 before).
+---
+ .../dev/horizonlab/platform/HorizonHooks.java |  5 ++++
+ .../horizonlab/platform/HorizonWorldgen.java  | 30 +++++++++++++++++--
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonHooks.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonHooks.java
+index f7cf984196..6245b00b23 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonHooks.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonHooks.java
+@@ -1476,6 +1476,11 @@ public final class HorizonHooks {
+ 
+     private static Object argument(Class<?> owner, Object self, Class<?> type, java.lang.reflect.Type generic) {
+         if (type.isPrimitive()) return zero(type);
++        // A level's world storage (ServerLevel's constructor: BCLib reads its level id): the
++        // bridge's own, beside Horizon's world (HorizonWorldgen.levelStorage). (UMP, 2026-11-11)
++        if (type == net.minecraft.world.level.storage.LevelStorageSource.LevelStorageAccess.class) {
++            return HorizonWorldgen.levelStorage();
++        }
+         // A level's stem (ServerLevel's constructor: its generator, which BCLib's and BetterEnd's
+         // handlers read), from the registries by the level's dimension.
+         if (type == net.minecraft.world.level.dimension.LevelStem.class && self instanceof net.minecraft.world.level.Level level) {
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+index ec628aa345..1313ddd2fc 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+@@ -253,7 +253,7 @@ public final class HorizonWorldgen {
+                     ? HorizonServer.worldDir().resolve("horizon-java").resolve("levels")
+                     : java.nio.file.Files.createTempDirectory("horizon-java-levels");
+             java.nio.file.Files.createDirectories(base);
+-            var storage = net.minecraft.world.level.storage.LevelStorageSource.createDefault(base).createAccess("world");
++            var storage = storage(base);
+             HorizonData.Loaded data = HorizonData.loaded;
+             var stem = new net.minecraft.server.WorldStem(data.resources(), data.reloadable(), data.registries(),
+                     new net.minecraft.world.level.storage.LevelDataAndDimensions.WorldDataAndGenSettings(
+@@ -266,6 +266,30 @@ public final class HorizonWorldgen {
+         }
+     }
+ 
++    /** The bridge's own world storage for mods' set-up (one a process: it holds the folder's lock). */
++    private static net.minecraft.world.level.storage.LevelStorageSource.LevelStorageAccess storageAccess;
++
++    private static synchronized net.minecraft.world.level.storage.LevelStorageSource.LevelStorageAccess storage(
++            java.nio.file.Path base) throws java.io.IOException {
++        if (storageAccess == null) {
++            storageAccess = net.minecraft.world.level.storage.LevelStorageSource.createDefault(base).createAccess("world");
++        }
++        return storageAccess;
++    }
++
++    /** That storage for a level's constructor hooks, made if the server's start hasn't: null if it can't be. */
++    static net.minecraft.world.level.storage.LevelStorageSource.LevelStorageAccess levelStorage() {
++        try {
++            java.nio.file.Path base = HorizonServer.worldDir() != null
++                    ? HorizonServer.worldDir().resolve("horizon-java").resolve("levels")
++                    : java.nio.file.Files.createTempDirectory("horizon-java-levels");
++            java.nio.file.Files.createDirectories(base);
++            return storage(base);
++        } catch (Throwable t) {
++            return null;
++        }
++    }
++
+     private static final String LEVEL_CONSTRUCTOR = "(Lnet/minecraft/server/MinecraftServer;Ljava/util/concurrent/Executor;"
+             + "Lnet/minecraft/world/level/storage/LevelStorageSource$LevelStorageAccess;"
+             + "Lnet/minecraft/world/level/storage/ServerLevelData;Lnet/minecraft/resources/ResourceKey;"
+@@ -280,7 +304,9 @@ public final class HorizonWorldgen {
+     private static void levelHooks(ServerLevel level, String dimension, long seed) {
+         var stem = HorizonData.stem(level.dimension().identifier());
+         if (stem == null) return;
+-        Object[] args = {HorizonServer.server(), (java.util.concurrent.Executor) Runnable::run, null,
++        // The world's storage as a server's (BCLib/BetterEnd read its level id there): the bridge's
++        // own folder beside Horizon's world, not Horizon's files. (UMP, 2026-11-11)
++        Object[] args = {HorizonServer.server(), (java.util.concurrent.Executor) Runnable::run, levelStorage(),
+                 HorizonData.loaded.worldData(), level.dimension(), stem, false,
+                 net.minecraft.world.level.biome.BiomeManager.obfuscateSeed(seed), List.of(), true};
+         for (String at : new String[] {"RETURN", "TAIL"}) {
+-- 
+2.56.0.windows.2
+

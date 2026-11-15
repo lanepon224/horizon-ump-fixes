@@ -1,0 +1,29 @@
+From 1c7f846e0039e0d60771fd504731ed1265d72af7 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 06/90] port-pack: write block declarations compact
+
+A block with many states (Diagonal Fences' snow fence) has a state table of millions of entries: 19 MiB pretty-printed, over the content reader's 16 MiB per-file limit, so the mod's content was refused. Compact JSON is 5.6 MiB.
+---
+ crates/horizon-port-pack/src/carry/declare.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-port-pack/src/carry/declare.rs b/crates/horizon-port-pack/src/carry/declare.rs
+index c1f34011aa..614ab6dca0 100644
+--- a/crates/horizon-port-pack/src/carry/declare.rs
++++ b/crates/horizon-port-pack/src/carry/declare.rs
+@@ -19,7 +19,10 @@ pub(super) fn namespace(
+     let prefix = format!("{ns}:");
+     let decl = inside.join(format!("data/{ns}/horizon"));
+     let write_decl = |kind: &str, name: &str, v: &Value| {
+-        let text = serde_json::to_vec_pretty(v).unwrap_or_default();
++        // Compact: a block with many states (Diagonal Fences' snow fence: 9 layers x 8 sides) has a state
++        // table of millions of entries, 19 MiB pretty-printed (over the content reader's 16 MiB per file) and
++        // 5.6 MiB compact. Pretty-printing only cost load time and size. (UMP, 2026-11-11)
++        let text = serde_json::to_vec(v).unwrap_or_default();
+         write(&decl.join(format!("{kind}/{name}.json")), &text)
+     };
+     // The report's names: the path under the id, `ns:path` under another namespace.
+-- 
+2.56.0.windows.2
+

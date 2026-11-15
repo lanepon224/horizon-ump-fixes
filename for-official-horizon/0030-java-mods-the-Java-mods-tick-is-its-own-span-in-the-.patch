@@ -1,0 +1,28 @@
+From 10c300f851d9a277b46aee45229d90641edc0cc3 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 30/90] java mods: the Java mods' tick is its own span in the
+ slow-tick line
+
+HORIZON_SPIKES' slow ticks now name tick_java (wall/cpu), so the mods' share of a long server tick shows beside Horizon's own steps.
+---
+ crates/horizon-client/src/game.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index bdca53669f..b67dfc3993 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -7948,7 +7948,8 @@ impl Game<'_> {
+         self.tick_command_extras();
+         self.native_tick();
+         self.tell_native_now();
+-        self.tick_java_server();
++        // Its own span in the slow-tick line (HORIZON_SPIKES), with the Java mods' share.
++        horizon_client::spans::time("tick_java", || self.tick_java_server());
+         self.tick_world(running)
+     }
+     /// What the tick runs after the local player's own update: effects, the
+-- 
+2.56.0.windows.2
+

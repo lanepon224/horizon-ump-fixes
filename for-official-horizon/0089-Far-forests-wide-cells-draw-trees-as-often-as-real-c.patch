@@ -1,0 +1,220 @@
+From c19e35954db6acc2125a61d2758c79b070278e27 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 89/90] Far forests: wide cells draw trees as often as real
+ chunks do
+
+A far cell 16 blocks or wider drew treetops whenever its biome's mean tree density said a quarter of it was covered: every wooded cell passed, so far forests were one solid sheet (73% of 16-wide forest cells drawn as trees; real chunks reduced to the same cells, 37%). Now the cell counts its own trees, placed as the narrow cells place them, and takes the largest share their crowns fill at one height, as Column::reduced counts a real chunk; it draws treetops past 40% (matched to real chunks).
+
+Test far_tree_cover_follows_real_chunks compares real decorated chunks with the estimate per biome over 15 areas: forest 16-wide cells real 41%, far 50% (was 73-78%).
+---
+ crates/horizon-client/src/vanillagen/lod.rs   | 98 +++++++++++++++++++
+ .../src/vanillagen/lod/vegetation.rs          | 69 ++++++++++++-
+ 2 files changed, 163 insertions(+), 4 deletions(-)
+
+diff --git a/crates/horizon-client/src/vanillagen/lod.rs b/crates/horizon-client/src/vanillagen/lod.rs
+index 92a43291c4..dae2285781 100644
+--- a/crates/horizon-client/src/vanillagen/lod.rs
++++ b/crates/horizon-client/src/vanillagen/lod.rs
+@@ -1229,6 +1229,104 @@ mod tests {
+     }
+     /// Small End islands are decoration over the void, so the direct sampler
+     /// has to estimate them from `end_island_decorated`.
++    /// Far tree cover against the real world: how many columns carry leaves on top in real
++    /// decorated chunks, and in the far estimate of the same columns (cells of 1 and 4). Prints the
++    /// share per biome; the estimate must stay within reach of the real cover. (UMP, 2026-11-15:
++    /// the user saw far land drawn with many more trees than the world has.)
++    #[test]
++    #[ignore = "requires prepared worldgen data in HORIZON_TEST_RESOURCES"]
++    fn far_tree_cover_follows_real_chunks() -> crate::Result<()> {
++        let root = std::path::PathBuf::from(
++            std::env::var_os("HORIZON_TEST_RESOURCES").expect("resources"),
++        );
++        let assets = crate::assets::Assets::load(&root)?;
++        let biomes = crate::biome::Biomes::load(&root)?;
++        let terrain = Arc::new(VanillaTerrain::new(
++            &root.join("worldgen"),
++            assets.registry,
++            &biomes,
++            1234,
++        )?);
++        let mut sampler = VanillaLodSampler::new(terrain.clone());
++        let is_tree = |state: BlockStateId| {
++            let name = &assets.registry.state(state).unwrap().name;
++            name.ends_with("_leaves") || name.ends_with("_log")
++        };
++        // Real decorated chunks in a 12x12 chunk area, from the decoration worker.
++        // 6x6 chunks in each of nine areas a few kilometres apart (many biomes).
++        let keys: Vec<(i32, i32)> = [(-70, 3), (40, -120), (150, 60), (-200, -40), (90, 200), (-120, 160), (250, -200), (-260, 220), (10, 10), (-66, 0), (-75, 8), (-300, 300), (320, 40), (-20, -300), (180, -320)]
++            .iter()
++            .flat_map(|&(ax, az)| (0..6).flat_map(move |z| (0..6).map(move |x| (ax + x, az + z))))
++            .collect();
++        sampler.request_detail(&keys, [0, 0]);
++        let mut real = std::collections::HashMap::new();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
++        while real.len() < keys.len() {
++            for (key, columns) in sampler.drain_details() {
++                real.insert(key, columns);
++            }
++            assert!(std::time::Instant::now() < deadline, "decoration worker stalled");
++            std::thread::sleep(std::time::Duration::from_millis(20));
++        }
++        // Per biome: (columns, real tree tops, estimated tree tops at width 1, at width 4, real at
++        // 16 reduced, estimated at 16).
++        let mut by_biome: std::collections::BTreeMap<String, [u32; 6]> = Default::default();
++        let mut fresh = VanillaLodSampler::new(terrain.clone());
++        for (&(cx, cz), columns) in &real {
++            for i in 0..256 {
++                let (x, z) = (cx * 16 + (i & 15) as i32, cz * 16 + (i >> 4) as i32);
++                let column = &columns[i];
++                let Some(surface) = column.surface else { continue };
++                let name = biomes.get(surface.biome).name.to_string();
++                let entry = by_biome.entry(name).or_default();
++                entry[0] += 1;
++                entry[1] += u32::from(column.spans.last().is_some_and(|s| is_tree(s.state)));
++                // The estimate of the same column, sampled straight from the generator.
++                let one = fresh.grid(x, z, 1, 1).pop().unwrap_or_default();
++                entry[2] += u32::from(one.spans.last().is_some_and(|s| is_tree(s.state)));
++                if (x & 3) == 0 && (z & 3) == 0 {
++                    let four = fresh.grid(x, z, 4, 1).pop().unwrap_or_default();
++                    entry[3] += 16 * u32::from(four.spans.last().is_some_and(|s| is_tree(s.state)));
++                }
++                if i == 0 {
++                    // The chunk as one 16-block cell: real chunk reduced, and the estimate.
++                    let reduced = Column::reduced(columns, 0, 0, 16);
++                    entry[4] += 256 * u32::from(reduced.spans.last().is_some_and(|s| is_tree(s.state)));
++                    let wide = fresh.grid(x, z, 16, 1).pop().unwrap_or_default();
++                    entry[5] += 256 * u32::from(wide.spans.last().is_some_and(|s| is_tree(s.state)));
++                }
++            }
++        }
++        let mut total = [0u32; 6];
++        for (biome, n) in &by_biome {
++            if n[0] < 256 {
++                continue;
++            }
++            let pct = |v: u32| v as f64 * 100.0 / n[0] as f64;
++            println!(
++                "{biome}: {} columns, real trees {:.0}%, far (1) {:.0}%, far (4) {:.0}%, 16-cells real {:.0}% far {:.0}%",
++                n[0], pct(n[1]), pct(n[2]), pct(n[3]), pct(n[4]), pct(n[5])
++            );
++            for k in 0..6 {
++                total[k] += n[k];
++            }
++        }
++        let pct = |v: u32| v as f64 * 100.0 / total[0].max(1) as f64;
++        println!(
++            "all: real trees {:.0}%, far (1) {:.0}%, far (4) {:.0}%, 16-cells real {:.0}% far {:.0}%",
++            pct(total[1]), pct(total[2]), pct(total[3]), pct(total[4]), pct(total[5])
++        );
++        // Forest cells drawn as trees about as often as real forest chunks reduce to trees
++        // (they were 73% to 37%: far forests one solid sheet).
++        let forest = by_biome.get("minecraft:forest").expect("the sampled areas hold forest");
++        let (real16, far16) = (forest[4] as f64 / forest[0] as f64, forest[5] as f64 / forest[0] as f64);
++        assert!(
++            (far16 - real16).abs() <= 0.15,
++            "16-wide forest cells: real {real16:.2}, far {far16:.2}"
++        );
++        Ok(())
++    }
++
+     #[test]
+     #[ignore = "requires prepared worldgen data in HORIZON_TEST_RESOURCES"]
+     fn end_small_islands_are_estimated_over_the_void() -> crate::Result<()> {
+diff --git a/crates/horizon-client/src/vanillagen/lod/vegetation.rs b/crates/horizon-client/src/vanillagen/lod/vegetation.rs
+index cd71cc0565..bee738a5ad 100644
+--- a/crates/horizon-client/src/vanillagen/lod/vegetation.rs
++++ b/crates/horizon-client/src/vanillagen/lod/vegetation.rs
+@@ -12,6 +12,12 @@ use horizon_world::{
+ };
+ use serde_json::Value;
+ 
++/// The share of a wide cell (16 blocks or more) its crowns must fill at one height for the cell to
++/// draw as treetops. Matched to real chunks reduced to such cells (`Column::reduced` keeps leaves
++/// where a quarter of the cell holds them at one height; this estimate places trees on level
++/// ground, so it needs more): forest cells 42% real, drawn 65% at 0.35, 32% at 0.45
++/// (far_tree_cover_follows_real_chunks, 2026-11-15).
++const WIDE_COVER: f64 = 0.4;
+ /// The widest LOD cell that draws chorus: a cell is drawn as a full-footprint
+ /// column, so a one-block plant in a wider cell would read as a coloured slab.
+ const CHORUS_CELL: i32 = 4;
+@@ -345,10 +351,14 @@ impl Vegetation {
+         if width >= 16 {
+             let n = hash(self.seed, x.div_euclid(4), z.div_euclid(4));
+             let tree = choose(n);
+-            let coverage = 1.
+-                - (-total * f64::from(tree.radius * tree.radius) * std::f64::consts::PI / 256.)
+-                    .exp();
+-            if coverage >= 0.25 {
++            // The cell's own trees, as the narrow cells place them (one chance per 4x4 block
++            // cell): the share of the cell their crowns cover. A real chunk reduced to this cell
++            // keeps leaves only where a quarter of it holds them (`Column::reduced`); the
++            // biome's mean density alone passed that in every wooded cell, so far forests were
++            // one solid sheet (73% of 16-wide forest cells drawn as trees, real chunks 37%;
++            // far_tree_cover_follows_real_chunks). (UMP, 2026-11-15)
++            let coverage = self.crown_cover(trees, total, x - width / 2, z - width / 2, width);
++            if coverage >= WIDE_COVER {
+                 // A wide cell is one block-textured box: its crown as high as a full tree drew
+                 // 16x16 slabs of leaves over every wooded cell, the square boxes of far forests
+                 // (user, 2026-11-14). The box is as high as the cell's trees are on average: full
+@@ -427,6 +437,57 @@ impl Vegetation {
+             });
+         }
+     }
++    /// The largest share of the `width`-wide cell at (`x0`, `z0`) its trees' crowns fill at one
++    /// height, as `Column::reduced` counts a real chunk's leaves: crowns of different heights
++    /// don't add up. Trees are placed as the narrow cells place them (a 4x4 block grid, one
++    /// chance each), on level ground; sampled on a grid of at most 16x16 points.
++    fn crown_cover(&self, trees: &[Tree], total: f64, x0: i32, z0: i32, width: i32) -> f64 {
++        let chance = (total / 16.).min(1.);
++        let radius = trees.iter().map(|t| t.radius).max().unwrap_or(2);
++        // Each crown: trunk position, radius², and its leaves' heights above the ground.
++        let mut crowns = Vec::new();
++        for cz in (z0 - radius).div_euclid(4)..=(z0 + width + radius).div_euclid(4) {
++            for cx in (x0 - radius).div_euclid(4)..=(x0 + width + radius).div_euclid(4) {
++                let n = hash(self.seed, cx, cz);
++                if (n as u32 as f64 / u32::MAX as f64) >= chance {
++                    continue;
++                }
++                let mut left = (n.rotate_left(21) as u32 as f64 / u32::MAX as f64) * total;
++                let tree = trees
++                    .iter()
++                    .find(|t| {
++                        left -= t.count;
++                        left <= 0.
++                    })
++                    .unwrap_or(&trees[trees.len() - 1]);
++                let height = tree.height + ((n >> 40) % (tree.variation.max(0) + 1) as u64) as i32;
++                let tx = cx * 4 + ((n >> 32) & 3) as i32;
++                let tz = cz * 4 + ((n >> 34) & 3) as i32;
++                crowns.push((tx, tz, tree.radius, height - tree.radius, height + 2));
++            }
++        }
++        // Points covered at each height above the ground (0..64).
++        let mut at_height = [0u32; 64];
++        let step = (width / 16).max(1);
++        let mut points = 0u32;
++        for pz in (z0..z0 + width).step_by(step as usize) {
++            for px in (x0..x0 + width).step_by(step as usize) {
++                points += 1;
++                let mut here = [false; 64];
++                for &(tx, tz, r, bottom, top) in &crowns {
++                    if (px - tx).pow(2) + (pz - tz).pow(2) <= r * r {
++                        for h in bottom.clamp(0, 63)..top.clamp(0, 64) {
++                            here[h as usize] = true;
++                        }
++                    }
++                }
++                for (h, covered) in here.iter().enumerate() {
++                    at_height[h] += u32::from(*covered);
++                }
++            }
++        }
++        f64::from(at_height.iter().copied().max().unwrap_or(0)) / f64::from(points.max(1))
++    }
+     /// A chorus plant as its place-and-grow feature leaves it: a 2..=5 block
+     /// stem under one fully grown flower, or a full-cell stand-in where the
+     /// output cell covers several blocks.
+-- 
+2.56.0.windows.2
+

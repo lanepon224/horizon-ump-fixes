@@ -1,0 +1,89 @@
+From 596620bae8c0e2e73daef02b815c30ba2bb6663e Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 22/90] java mods: server configs' defaults before the mods
+ generate features
+
+Horizon generates the spawn's chunks before its server's first tick and SERVER_STARTING, where Forge Config API Port loads NeoForge-style server configs; Lost Cities' feature read its profile config there and failed ('Cannot get config value before config is loaded'), so its cities never placed. ConfigTracker.loadDefaultServerConfigs runs once before the first feature step (reflective; nothing without the tracker); the real files still load at SERVER_STARTING. Firing SERVER_STARTING itself earlier was tried and broke XaeroLib (its registries freeze on the client's first frame). SERVER_STARTING is fired from one place now. UMP 100-mod gap run: 0 failures.
+---
+ .../horizonlab/platform/HorizonServer.java    | 41 ++++++++++++++++++-
+ .../horizonlab/platform/HorizonWorldgen.java  |  4 ++
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index 37d10bd165..888e0ed4c1 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -886,6 +886,45 @@ public final class HorizonServer {
+         return HorizonFunctions.ready();
+     }
+ 
++    private static boolean starting;
++
++    /**
++     * Fabric's SERVER_STARTING, once: from the first tick, or earlier when the mods' worldgen
++     * starts first (Horizon generates the spawn before its server ticks). Mods load their server
++     * configs there (Forge Config API Port: Lost Cities' profiles) and their features read them
++     * while generating. (UMP, 2026-11-11)
++     */
++    static synchronized void serverStarting(MinecraftServer server) {
++        if (starting || server == null) return;
++        starting = true;
++        fireEach("ServerLifecycleEvents.SERVER_STARTING", ServerLifecycleEvents.SERVER_STARTING, l -> l.onServerStarting(server));
++    }
++
++    private static volatile boolean serverConfigs;
++
++    /**
++     * NeoForge-style server configs (Forge Config API Port's ConfigTracker) with their defaults,
++     * once, if nothing loaded them yet: what a server's start does before generation. Reflective:
++     * nothing when no mod brings the tracker. The real files load at SERVER_STARTING as usual.
++     */
++    static void defaultServerConfigs() {
++        if (serverConfigs) return;
++        synchronized (HorizonServer.class) {
++            if (serverConfigs) return;
++            serverConfigs = true;
++            try {
++                Class<?> tracker = Class.forName("net.neoforged.fml.config.ConfigTracker", true, HorizonServer.class.getClassLoader());
++                Object instance = tracker.getField("INSTANCE").get(null);
++                tracker.getMethod("loadDefaultServerConfigs").invoke(instance);
++                Natives.log("Java mods: server configs' defaults loaded before generation (mods read them while generating)");
++            } catch (ClassNotFoundException e) {
++                // No mod uses them.
++            } catch (Throwable t) {
++                Natives.log("Java mods: server configs' defaults not loaded: " + t);
++            }
++        }
++    }
++
+     public static boolean worldgenStart(String dimension, long seed, boolean structures, String world,
+             String[] horizonCannot) {
+         Thread.currentThread().setContextClassLoader(HorizonServer.class.getClassLoader());
+@@ -1574,7 +1613,7 @@ public final class HorizonServer {
+             // The constructor's hooks (biome modifications) come before the server starts, as
+             // in vanilla, even when no dimension's generation has asked for them yet.
+             HorizonWorldgen.readyBeforeTicks(seed);
+-            fireEach("ServerLifecycleEvents.SERVER_STARTING", ServerLifecycleEvents.SERVER_STARTING, l -> l.onServerStarting(server));
++            serverStarting(server);
+             // MinecraftServer.loadLevel (runServer's initServer): the levels exist at its end.
+             hook(server, MinecraftServer.class, "loadLevel", "()V", "HEAD", NO_ARGUMENTS);
+             for (String dimension : levelIds()) {
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+index 1313ddd2fc..219262da53 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+@@ -1103,6 +1103,10 @@ public final class HorizonWorldgen {
+      * advancing neighbours never wait on each other in a circle.
+      */
+     private static void advance(Dimension d, ProtoChunk chunk, ChunkStatus target) {
++        // Mods' server configs before any feature is placed (Lost Cities reads its profile there):
++        // Horizon generates the spawn's chunks before its server's first tick and SERVER_STARTING,
++        // so the configs' defaults are loaded now, as a server start would. (UMP, 2026-11-11)
++        if (target.isOrAfter(ChunkStatus.FEATURES)) HorizonServer.defaultServerConfigs();
+         for (ChunkStatus status : STEPS) {
+             if (status.isAfter(target)) break;
+             if (chunk.getPersistedStatus().isOrAfter(status)) continue;
+-- 
+2.56.0.windows.2
+

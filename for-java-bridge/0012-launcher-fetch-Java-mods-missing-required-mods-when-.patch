@@ -1,0 +1,32 @@
+From 49123869325aee63e125d7da2bd6699d78c62d7b Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 12/90] launcher: fetch Java mods' missing required mods when
+ Play starts
+
+Play (Fabric 26.3 mods on) runs java_deps::resolve on the selected instance's mods-java/ after the Fabric mods build is ensured; its lines go to the game log on Play's bar.
+---
+ launcher/src/java_mods_page.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/launcher/src/java_mods_page.rs b/launcher/src/java_mods_page.rs
+index d9d4724e16..33d4292857 100644
+--- a/launcher/src/java_mods_page.rs
++++ b/launcher/src/java_mods_page.rs
+@@ -723,5 +723,12 @@ pub(super) fn ensure_at_play(java_build: bool, tag: &str, tx: &Sender<Msg>) -> R
+     let log = |line: &str| {
+         let _ = tx.send(Msg::Line(Job::Client, line.to_string()));
+     };
+-    java_variant::ensure_with(tag, &progress, &log)
++    java_variant::ensure_with(tag, &progress, &log)?;
++    // Plug and play: the mods the jars need and nobody added come from Modrinth first.
++    let dir = java_mods::dir(&horizon_launcher::instances::selected().home);
++    let report = horizon_launcher::java_deps::resolve(&horizon_launcher::browser::modrinth::Modrinth, &dir, &log);
++    for line in report.lines() {
++        log(&line);
++    }
++    Ok(())
+ }
+-- 
+2.56.0.windows.2
+

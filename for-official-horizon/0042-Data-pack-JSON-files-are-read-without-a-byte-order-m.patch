@@ -1,0 +1,58 @@
+From 85bbef2404b8e197264bdcd200552fc3230b13ec Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 42/90] Data pack JSON files are read without a byte-order mark
+
+Minecraft's JSON reader skips a leading UTF-8 byte-order mark; mods ship files saved with one (395 in UMP's 300-mod pack: Re-Avaritia's advancements, Lio's Overhauled Villages' worldgen...). serde_json refused them ('expected value at line 1 column 1'), which stopped that pack's world from opening. DataPack::read drops the mark from .json and .mcmeta files.
+---
+ crates/horizon-client-render/src/datapack.rs | 24 +++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client-render/src/datapack.rs b/crates/horizon-client-render/src/datapack.rs
+index 53b956e94f..58fccdf425 100644
+--- a/crates/horizon-client-render/src/datapack.rs
++++ b/crates/horizon-client-render/src/datapack.rs
+@@ -81,10 +81,18 @@ impl DataPack {
+             .collect()
+     }
+     pub fn read(&self, path: &str) -> Option<Vec<u8>> {
+-        match &self.source {
++        let mut bytes = match &self.source {
+             Source::Zip(z) => z.read(path).ok(),
+             Source::Dir(root) => std::fs::read(root.join(path)).ok(),
++        }?;
++        // A JSON file without its leading byte-order mark: Minecraft's reader skips one (mods ship
++        // files saved with it: 395 in UMP's 300-mod pack, Lio's Overhauled Villages' worldgen
++        // among them), and serde_json refused it ("expected value at line 1 column 1"), which
++        // stopped that pack's world from opening. (UMP, 2026-11-13)
++        if (path.ends_with(".json") || path.ends_with(".mcmeta")) && bytes.starts_with(b"\xef\xbb\xbf") {
++            bytes.drain(..3);
+         }
++        Some(bytes)
+     }
+ 
+     /// The `description` of `pack.mcmeta`, as text.
+@@ -938,6 +946,20 @@ mod tests {
+         assert_eq!(content_id("data/mymod/data_maps/item/fuel.txt"), None);
+     }
+ 
++    #[test]
++    fn json_files_are_read_without_a_byte_order_mark() {
++        let root = std::env::temp_dir().join(format!("hz-datapack-bom-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&root);
++        std::fs::create_dir_all(root.join("data/m")).unwrap();
++        std::fs::write(root.join("data/m/a.json"), b"\xef\xbb\xbf{\"x\":1}").unwrap();
++        std::fs::write(root.join("data/m/b.nbt"), b"\xef\xbb\xbfraw").unwrap();
++        let pack = DataPack::folder("file/bom", &root);
++        let json = pack.read("data/m/a.json").unwrap();
++        assert!(serde_json::from_slice::<serde_json::Value>(&json).is_ok());
++        assert!(pack.read("data/m/b.nbt").unwrap().starts_with(b"\xef\xbb\xbf"));
++        let _ = std::fs::remove_dir_all(&root);
++    }
++
+     #[test]
+     fn a_pack_that_cannot_be_copied_is_reported() {
+         let root = std::env::temp_dir().join(format!("hz-datapack-copy-{}", std::process::id()));
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,223 @@
+From fc48d48ecbc28edd7492d679fbc3cdd653cbd2e4 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 87/90] Big packs: leave out the largest content mods instead
+ of all, and widen sprite arrays
+
+Past MAX_STATES (2^20 block states) every content mod was refused together: a 300-mod pack (1.14M states) had none of its blocks, with a log line only. fit_states now counts each mod's states without building and leaves out the biggest until the rest fit; each one left out is logged and told to players as they join (with the other left-out mods). Then the pack's 18,134 block textures needed more than eight arrays of 2048 and the game refused to start ('No graphics driver'): layer_split widens the arrays up to the GPU's layer limit when needed (8192 on Vulkan/OpenGL).
+
+UMP top300: 348 content mods load, Diagonal Walls (257,024 states) left out with a chat line; the game starts and plays. Tests: leaves_out_the_biggest_mods_until_the_rest_fit, sprite_split_follows_the_adapters_layer_limit.
+---
+ crates/horizon-client-render/src/gfx.rs       | 10 +++
+ .../src/game/java_mods/bridge.rs              |  2 +
+ crates/horizon-client/src/game/mods.rs        | 20 ++++++
+ crates/horizon-client/src/mod_content.rs      | 67 +++++++++++++++++++
+ .../horizon-client/src/mod_content_tests.rs   | 35 ++++++++++
+ 5 files changed, 134 insertions(+)
+
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+index 7a8d37c5b6..b3f6cf308f 100644
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -1491,6 +1491,13 @@ fn layer_split(
+     layers: u32,
+ ) -> std::result::Result<u32, String> {
+     let mut split = requested.unwrap_or(SPRITE_SPLIT).min(max_layers).max(1);
++    // More sprites than the arrays hold at the usual split: wider arrays, up to the GPU's
++    // limit (a 300-mod pack has 18,134 block textures; at 2048 eight arrays hold 16,384, and the
++    // game refused to start on GPUs with 8192 layers per array). Only when needed: a full array
++    // is one texture. (UMP, 2026-11-15)
++    if requested.is_none() && layers > split * SPRITE_ARRAYS {
++        split = layers.div_ceil(SPRITE_ARRAYS).min(max_layers).max(split);
++    }
+     if split > 1 && array_layers(split, gl) > max_layers {
+         split -= 1;
+     }
+@@ -13037,6 +13044,9 @@ mod sprite_upload_tests {
+         let err = layer_split(128, false, None, 1291).unwrap_err();
+         assert!(err.contains("128 texture layers per array"), "{err}");
+         assert!(layer_split(512, false, None, 512 * SPRITE_ARRAYS + 1).is_err());
++        // More sprites than eight arrays of 2048: wider arrays where the GPU allows.
++        assert_eq!(layer_split(8192, false, None, 18_134), Ok(2267));
++        assert!(layer_split(2048, false, None, 18_134).is_err());
+     }
+ 
+     #[test]
+diff --git a/crates/horizon-client/src/game/java_mods/bridge.rs b/crates/horizon-client/src/game/java_mods/bridge.rs
+index 13dc36afbc..bb20f2f4c5 100644
+--- a/crates/horizon-client/src/game/java_mods/bridge.rs
++++ b/crates/horizon-client/src/game/java_mods/bridge.rs
+@@ -612,6 +612,8 @@ fn start_once(root: &Path, dir: &Path, jars: Vec<PathBuf>, side: horizon_jvm::Si
+         let mut left: Vec<String> = left_out().iter().map(|l| l.line()).collect();
+         // Mods that load but only partly work here (Flashback).
+         left.extend(horizon_jvm::renderers::partial_lines(bridge.mods()));
++        // Content mods whose blocks didn't fit in a world (mods.rs: fit_states).
++        left.extend(super::super::mods::LEFT_OUT_FOR_STATES.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned());
+         for line in &left {
+             log::info!("Java mods: {line}");
+         }
+diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
+index c450a57e01..06c58cbf9a 100644
+--- a/crates/horizon-client/src/game/mods.rs
++++ b/crates/horizon-client/src/game/mods.rs
+@@ -198,6 +198,23 @@ pub(super) fn content_root(
+             }
+         }
+     }
++    // More block states than a world holds: the biggest mods are left out, the rest load.
++    let too_big = mod_content::fit_states(root, &mut mods);
++    if !too_big.is_empty() {
++        let lines: Vec<String> = too_big
++            .iter()
++            .map(|(id, n)| {
++                format!(
++                    "{id} left out: its {n} block states don't fit beside the other mods' (a world holds {} in all)",
++                    mod_content::MAX_STATES
++                )
++            })
++            .collect();
++        for line in &lines {
++            log::warn!("Horizon: {line}");
++        }
++        *LEFT_OUT_FOR_STATES.lock().unwrap_or_else(|e| e.into_inner()) = lines;
++    }
+     let built = horizon_client::spans::startup::time("content.resource_root", || {
+         mod_content::resource_root(root, &mods, &horizon_cache())
+     });
+@@ -232,6 +249,9 @@ pub(super) fn content_root(
+     }
+ }
+ 
++/// Content mods left out because their block states didn't fit (`fit_states`), as lines players read.
++pub(in crate::game) static LEFT_OUT_FOR_STATES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
++
+ /// A loaded mod as a server tells joining clients (`horizon_protocol::mod_list`): its manifest's
+ /// id, version and side, and the SHA-256 of its `.hmod` (none for a folder).
+ fn announced_entry(
+diff --git a/crates/horizon-client/src/mod_content.rs b/crates/horizon-client/src/mod_content.rs
+index 6ea5279d56..373e3a1fdb 100644
+--- a/crates/horizon-client/src/mod_content.rs
++++ b/crates/horizon-client/src/mod_content.rs
+@@ -2933,6 +2933,73 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
+ /// The root is built once and kept: later starts with the same build, base
+ /// and mod files reuse it. With ATM10's carried mods a build takes about
+ /// 25 s and peaks above 3 GB, more than everything the game keeps.
++/// The mods' new block states, by mod, as `Plan::new` counts them (each block's template states
++/// times its own property combinations, or its own states), without building anything.
++pub fn state_counts(base: &Path, mods: &[ContentMod]) -> Result<(u32, Vec<(String, u64)>)> {
++    let mut facts = read_json(&base.join("facts.json"))?;
++    let Some(J::Arr(states)) = facts.at("states") else {
++        return Err("facts.json: no states".into());
++    };
++    let mut runs: BTreeMap<&str, u64> = BTreeMap::new();
++    for s in states.iter() {
++        if let J::Arr(row) = s
++            && let Some(J::Str(name)) = row.first()
++        {
++            *runs.entry(name.as_str()).or_default() += 1;
++        }
++    }
++    let vanilla = states.len() as u32;
++    let counts = mods
++        .iter()
++        .map(|m| {
++            let n: u64 = m
++                .content
++                .blocks
++                .iter()
++                .map(|b| {
++                    if !b.states.is_empty() {
++                        return b.states.len() as u64;
++                    }
++                    let template = runs.get(b.template.as_str()).copied().unwrap_or(1);
++                    let combos = b
++                        .state_properties
++                        .values()
++                        .fold(1u64, |p, v| p.saturating_mul(v.values().len() as u64));
++                    template.saturating_mul(combos)
++                })
++                .sum();
++            (m.id.clone(), n)
++        })
++        .collect();
++    Ok((vanilla, counts))
++}
++
++/// Leaves out of `mods` the ones with the most block states until the rest fit in a world
++/// (MAX_STATES), returning the ids left out with their counts. Past the limit every content
++/// mod was refused together: a 300-mod pack (1.14M states, five mods with 70k-257k each: Diagonal
++/// Walls/Fences/Windows, Rechiseled, Yuushya) had none of its blocks. (UMP, 2026-11-15)
++pub fn fit_states(base: &Path, mods: &mut Vec<ContentMod>) -> Vec<(String, u64)> {
++    let Ok((vanilla, counts)) = state_counts(base, mods) else {
++        return Vec::new();
++    };
++    let mut total: u64 = u64::from(vanilla) + counts.iter().map(|(_, n)| n).sum::<u64>();
++    if total <= u64::from(MAX_STATES) {
++        return Vec::new();
++    }
++    let mut by_size = counts;
++    by_size.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
++    let mut out = Vec::new();
++    for (id, n) in by_size {
++        if total <= u64::from(MAX_STATES) {
++            break;
++        }
++        total -= n;
++        out.push((id, n));
++    }
++    mods.retain(|m| !out.iter().any(|(id, _)| id == &m.id));
++    out
++}
++
+ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<PathBuf> {
+     if mods
+         .iter()
+diff --git a/crates/horizon-client/src/mod_content_tests.rs b/crates/horizon-client/src/mod_content_tests.rs
+index 8bbe9bb8ba..5858559729 100644
+--- a/crates/horizon-client/src/mod_content_tests.rs
++++ b/crates/horizon-client/src/mod_content_tests.rs
+@@ -750,6 +750,41 @@ fn refuses_more_states_than_a_world_holds() {
+     fs::remove_dir_all(&scratch).unwrap();
+ }
+ 
++#[test]
++fn leaves_out_the_biggest_mods_until_the_rest_fit() {
++    let Some(base) = prepared() else {
++        return;
++    };
++    let scratch = std::env::temp_dir().join(format!("horizon-mod-fit-{}", std::process::id()));
++    let _ = fs::remove_dir_all(&scratch);
++    let small = ruby_mod(&scratch.join("ruby"));
++    // 810 redstone wires (1296 states each) pass 2^20 alone: that mod goes, the small one stays.
++    let mut big = ruby_mod(&scratch.join("wires"));
++    big.id = "wires".into();
++    let mut wire = big.content.blocks[0].clone();
++    wire.template = "minecraft:redstone_wire".into();
++    big.content.blocks.clear();
++    for i in 0..810 {
++        let mut b = wire.clone();
++        b.id = format!("wires:wire_{i}");
++        big.content.blocks.push(b);
++    }
++    let small_id = small.id.clone();
++    let mut mods = vec![small, big];
++    let (_, counts) = crate::mod_content::state_counts(&base, &mods).unwrap();
++    assert_eq!(counts.iter().find(|(id, _)| id == "wires").unwrap().1, 810 * 1296);
++    let out = crate::mod_content::fit_states(&base, &mut mods);
++    assert_eq!(out.len(), 1);
++    assert_eq!(out[0].0, "wires");
++    assert_eq!(mods.len(), 1);
++    assert_eq!(mods[0].id, small_id);
++    // What fits is left as it is.
++    let mut alone = mods;
++    assert!(crate::mod_content::fit_states(&base, &mut alone).is_empty());
++    assert_eq!(alone.len(), 1);
++    let _ = fs::remove_dir_all(&scratch);
++}
++
+ #[test]
+ fn builds_past_sixteen_bit_states() {
+     let Some(base) = prepared() else {
+-- 
+2.56.0.windows.2
+

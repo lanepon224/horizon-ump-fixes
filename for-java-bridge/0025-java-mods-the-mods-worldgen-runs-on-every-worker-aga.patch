@@ -1,0 +1,56 @@
+From fc29e19b90389230fa006840f1aa1be8e4b740c5 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 25/90] java mods: the mods' worldgen runs on every worker
+ again
+
+UMP's first fix for the worldgen deadlock (0001) took one lock per dimension around every step, which made the mods' world generation single-threaded: with 100 mods the server tick spent 90+ ms on it. The deadlock came from holding a chunk's lock while bringing its neighbours up; now the neighbours are readied holding no lock, steps before FEATURES lock only their own chunk, and FEATURES (which writes into its neighbours) keeps the dimension's lock. UMP perf_test, 100 mods: steady-state Java tick 14-27 ms (was 90-170), flying 1% low 51 fps (was 37), no deadlock.
+---
+ .../horizonlab/platform/HorizonWorldgen.java  | 21 ++++++++++++-------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+index 219262da53..0002f2aea7 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonWorldgen.java
+@@ -1110,14 +1110,19 @@ public final class HorizonWorldgen {
+         for (ChunkStatus status : STEPS) {
+             if (status.isAfter(target)) break;
+             if (chunk.getPersistedStatus().isOrAfter(status)) continue;
+-            // UMP patch 2026-11-10: one lock per dimension instead of per chunk. Per-chunk locks deadlocked under
+-            // parallel generation: each thread held one chunk and waited for a neighbour another held (see
+-            // ump/poc/hang/threads.txt). The lock is reentrant, so a step that advances its neighbours still works.
+-            synchronized (d) {
++            // The neighbours this step reads are brought to their statuses first, holding no lock: a
++            // thread never waits for a neighbour while holding a chunk (the per-chunk locks of before
++            // deadlocked that way, ump/poc/hang/threads.txt), and generation runs on every worker at once
++            // (one lock per dimension, UMP's first fix, made the mods' worldgen single-threaded: 90+ ms of
++            // the server tick with 100 mods). Steps before FEATURES write only their own chunk: its lock.
++            // FEATURES writes into its eight neighbours, so two of them at once would race: one lock per
++            // dimension for it, taken after its neighbours are ready. (UMP, 2026-11-11)
++            ChunkStep step = ChunkPyramid.GENERATION_PYRAMID.getStepTo(status);
++            long started = HorizonProfile.start();
++            var cache = around(d, chunk, step);
++            Object lock = status == ChunkStatus.FEATURES ? d : chunk;
++            synchronized (lock) {
+                 if (chunk.getPersistedStatus().isOrAfter(status)) continue;
+-                ChunkStep step = ChunkPyramid.GENERATION_PYRAMID.getStepTo(status);
+-                long started = HorizonProfile.start();
+-                var cache = around(d, chunk, step);
+                 boolean outer = ON_WORKER.get();
+                 ON_WORKER.set(true);
+                 try {
+@@ -1125,9 +1130,9 @@ public final class HorizonWorldgen {
+                 } finally {
+                     ON_WORKER.set(outer);
+                 }
+-                HorizonProfile.add("worldgen " + status.getName(), started);
+                 if (!chunk.getPersistedStatus().isOrAfter(status)) chunk.setPersistedStatus(status);
+             }
++            HorizonProfile.add("worldgen " + status.getName(), started);
+         }
+     }
+ 
+-- 
+2.56.0.windows.2
+

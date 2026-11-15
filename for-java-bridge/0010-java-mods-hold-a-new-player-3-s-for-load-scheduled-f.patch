@@ -1,0 +1,34 @@
+From acd8b51f6c0d01a3fabbbd86524ab74f5e54f133 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 10/90] java mods: hold a new player 3 s for load-scheduled
+ functions, not 10 s
+
+Skyblock Infinite places its island 2 s after load (covered). Repeating clocks (Incendium's 7 s and other structure mods') are not first-moment setup: waiting a whole period added 7 s to every join of a 100-mod pack. Vanilla waits for no scheduled function. UMP load test: hold 140 -> 20 ticks.
+---
+ .../dev/horizonlab/platform/HorizonFunctions.java        | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonFunctions.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonFunctions.java
+index a92b6b3828..bd45f92178 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonFunctions.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonFunctions.java
+@@ -82,8 +82,13 @@ public final class HorizonFunctions {
+      */
+     private static volatile long settleAt = -1;
+     private static volatile long gameTime;
+-    /** How long after load scheduled events still hold the first player (10 s). */
+-    private static final long SETTLE_TICKS = 200;
++    /**
++     * How long after load scheduled events still hold the first player (3 s). Skyblock Infinite places its
++     * island 2 s after load: covered. Repeating clocks (Incendium's 7 s, other structure mods') are not
++     * first-moment setup: waiting a whole period for them added 7 s to every join of a 100-mod pack
++     * (UMP load test), and vanilla waits for no scheduled function at all.
++     */
++    private static final long SETTLE_TICKS = 60;
+ 
+     /** Whether the load functions have run (or won't: no data, a failure), and what they scheduled for the first seconds. */
+     static boolean ready() {
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,125 @@
+From 48758368c56b1f45876ecaee50ef66378746c4ec Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 54/90] Faster loads with big mod packs: shapes deduplicated by
+ hash, data folders read by several threads
+
+Behaviours::build looked each state's collision shape up among the shapes so far by a linear search: quadratic, minutes with a modded pack's 200k states (two threads at 100% through a warm start). It is a hash map by the shape's identity now (VoxelShape::identity_key). json_folder::read opened and read a folder's files one at a time; with tens of thousands (a pack's recipes, loot tables, item models) that took minutes on every start; read_all uses several threads for folders over 512 files, in the same order.
+
+UMP, 184 mods, warm start on an SSD: items 111 -> 46 s, item models 112 -> 37 s, network recipes 94 -> 36 s, recipes 75 -> 32 s; ready 1090 -> 896 s.
+---
+ crates/horizon-core/src/geometry/shape.rs |  5 +++
+ crates/horizon-world/src/json_folder.rs   | 43 ++++++++++++++++++-----
+ crates/horizon-world/src/level/data.rs    | 14 ++++----
+ 3 files changed, 46 insertions(+), 16 deletions(-)
+
+diff --git a/crates/horizon-core/src/geometry/shape.rs b/crates/horizon-core/src/geometry/shape.rs
+index 0f42abd130..e6e22275c2 100644
+--- a/crates/horizon-core/src/geometry/shape.rs
++++ b/crates/horizon-core/src/geometry/shape.rs
+@@ -226,6 +226,11 @@ impl VoxelShape {
+     pub fn same_identity(&self, other: &Self) -> bool {
+         Arc::ptr_eq(&self.identity, &other.identity)
+     }
++    /// A key equal for two shapes exactly when [`Self::same_identity`] holds, while both are
++    /// alive: for hashing shapes by identity.
++    pub fn identity_key(&self) -> usize {
++        Arc::as_ptr(&self.identity) as usize
++    }
+     /// A separately constructed shape with the same immutable grid. Storage is
+     /// shared, while identity-sensitive vanilla join shortcuts remain distinct.
+     pub fn fresh_identity(&self) -> Self {
+diff --git a/crates/horizon-world/src/json_folder.rs b/crates/horizon-world/src/json_folder.rs
+index 66e511d11f..1b1b2d48b8 100644
+--- a/crates/horizon-world/src/json_folder.rs
++++ b/crates/horizon-world/src/json_folder.rs
+@@ -52,15 +52,7 @@ pub fn read(dir: &Path) -> io::Result<Arc<Folder>> {
+     }
+     let files = match prepared(dir) {
+         Some(files) => files,
+-        None => list(dir)?
+-            .into_iter()
+-            .map(|(name, path)| {
+-                let bytes = fs::read(&path)
+-                    .map(Vec::into_boxed_slice)
+-                    .map_err(|e| (e.kind(), e.to_string()));
+-                File { name, path, bytes }
+-            })
+-            .collect(),
++        None => read_all(list(dir)?),
+     };
+     let folder = Arc::new(Folder { files });
+     let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+@@ -73,6 +65,39 @@ pub fn read(dir: &Path) -> io::Result<Arc<Folder>> {
+     Ok(folder)
+ }
+ 
++/// Reads the listed files, by several threads when there are many: a modded pack's folders
++/// hold tens of thousands of separate files (its mods' recipes, loot tables, models), one open
++/// and read each, and one at a time they took minutes of a start. In list order. (UMP, 2026-11-13)
++fn read_all(listed: Vec<(String, PathBuf)>) -> Vec<File> {
++    let read = |(name, path): (String, PathBuf)| {
++        let bytes = fs::read(&path)
++            .map(Vec::into_boxed_slice)
++            .map_err(|e| (e.kind(), e.to_string()));
++        File { name, path, bytes }
++    };
++    if listed.len() < 512 {
++        return listed.into_iter().map(read).collect();
++    }
++    let threads = std::thread::available_parallelism()
++        .map_or(4, |n| n.get())
++        .clamp(1, 8);
++    let chunk = listed.len().div_ceil(threads);
++    let mut parts: Vec<Vec<(String, PathBuf)>> = Vec::new();
++    let mut rest = listed.into_iter().peekable();
++    while rest.peek().is_some() {
++        parts.push(rest.by_ref().take(chunk).collect());
++    }
++    std::thread::scope(|scope| {
++        let jobs: Vec<_> = parts
++            .into_iter()
++            .map(|part| scope.spawn(move || part.into_iter().map(read).collect::<Vec<_>>()))
++            .collect();
++        jobs.into_iter()
++            .flat_map(|job| job.join().unwrap_or_default())
++            .collect()
++    })
++}
++
+ /// `dir`'s `.json` files from its prepared root's `horizon-data.bin`, when
+ /// that holds them: one open handle instead of a file opened for each.
+ fn prepared(dir: &Path) -> Option<Vec<File>> {
+diff --git a/crates/horizon-world/src/level/data.rs b/crates/horizon-world/src/level/data.rs
+index ccd17a939a..d715527ffd 100644
+--- a/crates/horizon-world/src/level/data.rs
++++ b/crates/horizon-world/src/level/data.rs
+@@ -771,18 +771,18 @@ fn build_with_gameplay<G: GameplayStateSource>(
+     let cached = CachedCollisionRegistry::from_table(collision_file.table("collision")?)?;
+     let mut shapes: Vec<VoxelShape> = Vec::new();
+     let mut shape_ids = Vec::with_capacity(table.state_count());
++    // By identity: a linear search of the shapes so far for every state took minutes with a
++    // modded pack's 200k states (UMP: 2 threads at 100% for most of a warm start).
++    let mut by_identity: HashMap<usize, usize> = HashMap::new();
+     for id in 0..table.state_count() {
+         let Some(shape) = cached.cached_shape(BlockStateId(id as u32))? else {
+             shape_ids.push(-1);
+             continue;
+         };
+-        let index = match shapes.iter().position(|s| s.same_identity(shape)) {
+-            Some(index) => index,
+-            None => {
+-                shapes.push(shape.clone());
+-                shapes.len() - 1
+-            }
+-        };
++        let index = *by_identity.entry(shape.identity_key()).or_insert_with(|| {
++            shapes.push(shape.clone());
++            shapes.len() - 1
++        });
+         shape_ids.push(index as i32);
+     }
+ 
+-- 
+2.56.0.windows.2
+

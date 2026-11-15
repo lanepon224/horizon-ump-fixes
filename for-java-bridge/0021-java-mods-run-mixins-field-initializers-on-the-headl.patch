@@ -1,0 +1,29 @@
+From 61fed66b1561bd05003ad8224e6a5fe5c665dcac Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 21/90] java mods: run mixins' field initializers on the
+ headless client
+
+Minecraft is allocated without its constructor, so fields mixins add to it with an initializer stayed null: Spell Engine's concurrentKeys failed in every key handling. HorizonHooks.initFields(minecraft) before the start's hooks, as the constructor runs them first. UMP 100-mod gap run: 0 failures (3 before).
+---
+ .../java/platform/dev/horizonlab/platform/HorizonClient.java  | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index a8b5c5bdb6..ded95fe30e 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -54,6 +54,10 @@ public final class HorizonClient {
+      */
+     public static void gameStart(boolean after) {
+         HorizonHooks.scanNow();
++        // The mixins' field initializers on the client, which its constructor would run first
++        // (allocated without it): Spell Engine's key list was null in every key handling.
++        // (UMP, 2026-11-11)
++        if (!after) HorizonHooks.initFields(minecraft);
+         HorizonHooks.fireClient(minecraft, after ? HorizonHooks.START_AFTER : HorizonHooks.START_BEFORE);
+     }
+ 
+-- 
+2.56.0.windows.2
+

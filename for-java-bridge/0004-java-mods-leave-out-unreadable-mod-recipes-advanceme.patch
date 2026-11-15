@@ -1,0 +1,82 @@
+From 37720e25042477571823d3d300d58283880f2709 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 04/90] java mods: leave out unreadable mod
+ recipes/advancements instead of failing the world load
+
+26.3 loads recipes and advancements as registries; vanilla turns one element that fails to parse into a crash of the whole load. Mods ship data for other mods' versions (Just Enough Breeding 3.4.1's Friends & Foes recipes fail on plain Minecraft too), so one stale file made a 100-mod pack unplayable. Those leaf entries are now dropped with a log line naming them; every other registry error still fails as vanilla's.
+---
+ .../platform/mixin/TolerantRegistryMixin.java | 46 +++++++++++++++++++
+ .../platform/horizon-platform.mixins.json     |  3 +-
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
+new file mode 100644
+index 0000000000..f21636bc8c
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
+@@ -0,0 +1,46 @@
++package dev.horizonlab.platform.mixin;
++
++import dev.horizonlab.bridge.Natives;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import net.minecraft.core.registries.Registries;
++import net.minecraft.resources.RegistryDataLoader;
++import net.minecraft.resources.ResourceKey;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/**
++ * One mod's unreadable recipe or advancement no longer stops the game (UMP, 2026-11-11). In 26.3 recipes and
++ * advancements load as registries, and vanilla turns any element that fails to parse into a crash of the whole
++ * world load. Mods ship data for other mods' versions (Just Enough Breeding 3.4.1's Friends &amp; Foes recipes fail
++ * to parse with Friends &amp; Foes 5.0.4, on plain Minecraft too), so one stale file made a 100-mod pack unplayable.
++ * These leaf entries are now left out with a line naming them; every other registry error still fails as vanilla's.
++ */
++@Mixin(RegistryDataLoader.class)
++public abstract class TolerantRegistryMixin {
++    private static final Set<ResourceKey<?>> TOLERATED = Set.of(Registries.RECIPE, Registries.ADVANCEMENT);
++
++    @Inject(method = "lambda$load$2", at = @At("HEAD"), require = 0)
++    private static void horizon$leaveOutBrokenData(List<?> tasks, Map<ResourceKey<?>, Exception> errors, Void unused,
++                                                   CallbackInfoReturnable<?> cir) {
++        if (errors == null || errors.isEmpty()) return;
++        synchronized (errors) {
++            for (Iterator<Map.Entry<ResourceKey<?>, Exception>> it = errors.entrySet().iterator(); it.hasNext();) {
++                var e = it.next();
++                ResourceKey<?> key = e.getKey();
++                if (!TOLERATED.contains(ResourceKey.createRegistryKey(key.registry()))) continue;
++                Throwable root = e.getValue();
++                while (root.getCause() != null && root.getCause() != root) root = root.getCause();
++                String why = String.valueOf(root.getMessage());
++                if (why.length() > 160) why = why.substring(0, 160) + "...";
++                Natives.log("Java mods: " + key.identifier().getNamespace() + "'s " + key.registry().getPath() + " "
++                        + key.identifier() + " can't be read (left out): " + why);
++                it.remove();
++            }
++        }
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+index cd402cf277..fcdb78e26f 100644
+--- a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
++++ b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+@@ -47,7 +47,8 @@
+     "MirrorUpdatesMixin",
+     "MirrorConnectionMixin",
+     "CombatCaptureMixin",
+-    "FallCaptureMixin"
++    "FallCaptureMixin",
++    "TolerantRegistryMixin"
+   ],
+   "injectors": {
+     "defaultRequire": 1
+-- 
+2.56.0.windows.2
+

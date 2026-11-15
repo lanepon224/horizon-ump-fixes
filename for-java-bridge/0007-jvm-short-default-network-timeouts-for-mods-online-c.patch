@@ -1,0 +1,31 @@
+From bc527149b3b97c5519c4db3a11f23797cb55afb5 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 07/90] jvm: short default network timeouts for mods' online
+ checks
+
+Mods' update/Patreon checks (Xaero's maps) opened URLConnections with no timeout and waited ~10 s for the system connect timeout during the world's start when a host didn't answer. sun.net.client.defaultConnectTimeout=3000 and defaultReadTimeout=5000 let them fail fast; mods setting their own keep theirs. UMP load test, 100 mods: warm start 73 s -> 52 s, world join 30 s -> 22 s.
+---
+ crates/horizon-jvm/src/lib.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/horizon-jvm/src/lib.rs b/crates/horizon-jvm/src/lib.rs
+index 129275c2b9..0e7ec2e73b 100644
+--- a/crates/horizon-jvm/src/lib.rs
++++ b/crates/horizon-jvm/src/lib.rs
+@@ -616,6 +616,12 @@ fn create_vm(
+         "-XX:G1PeriodicGCInterval=30000".into(),
+         // Mods' identifiers and the mirror's names repeat: ~1.3M strings in a big pack.
+         "-XX:+UseStringDeduplication".into(),
++        // Mods' online checks (update checkers, Patreon lists: Xaero's maps) opened with
++        // URLConnection's default of no timeout waited ~10 s each for the system's connect timeout
++        // on the world's start when a host didn't answer (UMP load-time test, 100 mods). A short
++        // connect timeout lets them fail fast; mods that set their own keep theirs.
++        "-Dsun.net.client.defaultConnectTimeout=3000".into(),
++        "-Dsun.net.client.defaultReadTimeout=5000".into(),
+     ];
+     if let Some(archive) = archive {
+         options.push("-XX:+AutoCreateSharedArchive".into());
+-- 
+2.56.0.windows.2
+

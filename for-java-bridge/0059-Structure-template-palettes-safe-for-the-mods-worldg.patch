@@ -1,0 +1,68 @@
+From 9c31902ccd2f05bf50ff9a390b5758c13e17157e Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 59/90] Structure template palettes safe for the mods' worldgen
+ threads
+
+StructureTemplate.Palette caches its blocks by type in a HashMap; vanilla builds structure starts on one thread, Horizon runs the mods' worldgen on several, and two placing one template at once threw ConcurrentModificationException in Palette.blocks(Block) (jigsaw placement): the chunk fell back to Horizon's generator without the mod's structure (UMP pack3, 38 mods). The cache is a ConcurrentHashMap.
+
+UMP: pack3 multimod 16/16 twice, no 'proto failed'.
+---
+ .../platform/mixin/TemplatePaletteMixin.java  | 32 +++++++++++++++++++
+ .../platform/horizon-platform.mixins.json     |  1 +
+ 2 files changed, 33 insertions(+)
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplatePaletteMixin.java
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplatePaletteMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplatePaletteMixin.java
+new file mode 100644
+index 0000000000..6ca5b48d20
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplatePaletteMixin.java
+@@ -0,0 +1,32 @@
++package dev.horizonlab.platform.mixin;
++
++import net.minecraft.world.level.block.Block;
++import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Mutable;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++import java.util.List;
++import java.util.Map;
++
++/**
++ * A structure template's palette caches its blocks by type in a HashMap (Palette.blocks(Block),
++ * which jigsaw placement reads). Vanilla builds structure starts on one thread; Horizon runs the
++ * mods' world generation on several, and a template two of them place at once threw
++ * ConcurrentModificationException from that map's computeIfAbsent: the chunk fell back to
++ * Horizon's own generator, without the mods' structure. The cache is a ConcurrentHashMap here.
++ * (UMP, 2026-11-14)
++ */
++@Mixin(StructureTemplate.Palette.class)
++public abstract class TemplatePaletteMixin {
++    @Shadow @Final @Mutable private Map<Block, List<StructureTemplate.StructureBlockInfo>> cache;
++
++    @Inject(method = "<init>", at = @At("RETURN"))
++    private void horizon$concurrentCache(CallbackInfo info) {
++        this.cache = new java.util.concurrent.ConcurrentHashMap<>(this.cache);
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+index 67265e49c0..df4391b769 100644
+--- a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
++++ b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+@@ -6,6 +6,7 @@
+   "mixins": [
+     "EntityAccess",
+     "TemplateCacheMixin",
++    "TemplatePaletteMixin",
+     "ServerCommonListenerAccess",
+     "PlayerListAccess",
+     "MinecraftServerAccess",
+-- 
+2.56.0.windows.2
+

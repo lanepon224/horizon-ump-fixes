@@ -1,0 +1,141 @@
+From 2447d47689a194eb822d4253683fd3644e46eb67 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 65/90] Far terrain: no square boxes from one tree or one high
+ column
+
+Column::reduced drew a height wherever any column of a coarse cell held a block there: one tree in a 16x16 cell made a 16x16 box of leaves and one high column raised the whole cell (the user saw square boxes and blocky, 'melted' hills far away). A height is drawn now where at least a quarter of the cell holds a block, and the gaps under it take what any column holds (trunks stay under crowns, nothing hangs). The span edges are sorted once for both sweeps. The stand-in crowns of wide sampled cells are as high as their trees' cover: full crown height where the canopy closes, lower as it thins, varied a block or two.
+
+UMP, 300 mods LOD 512: still 315-324 fps (was 220-234), flying 169-177 avg; LOD tests 68/68.
+---
+ crates/horizon-client-render/src/lod.rs       | 56 ++++++++++++++++++-
+ .../src/vanillagen/lod/vegetation.rs          | 21 ++++---
+ 2 files changed, 66 insertions(+), 11 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/lod.rs b/crates/horizon-client-render/src/lod.rs
+index 6743bbe9c9..d2866ca40b 100644
+--- a/crates/horizon-client-render/src/lod.rs
++++ b/crates/horizon-client-render/src/lod.rs
+@@ -320,6 +320,12 @@ impl Column {
+         if width == 1 {
+             return columns[z * 16 + x].clone();
+         }
++        // A height is drawn where at least a quarter of the footprint holds a block there
++        // (cells of 2 or less: any one column): with "any column", one tree made a 16x16 box
++        // of leaves and one high column raised the whole cell, far terrain's square boxes and
++        // blocky hills (user, 2026-11-14). Under what is drawn, a gap takes what any column
++        // holds there (trunks stay under their crowns, nothing hangs in the air).
++        // The footprint's span edges, sorted once for both sweeps.
+         let mut events = Vec::new();
+         for dz in z..z + width {
+             for dx in x..x + width {
+@@ -331,15 +337,41 @@ impl Column {
+             }
+         }
+         events.sort_unstable_by_key(|event| event.0);
++        let any = Self::sweep(&events, 1);
++        if width <= 2 {
++            return any;
++        }
++        let most = Self::sweep(&events, (width * width / 4) as i32);
++        let mut out = Self::default();
++        for span in most.spans.iter() {
++            let from = out.spans.last().map(|s| s.max);
++            if let Some(from) = from
++                && from < span.min
++            {
++                for fill in any.spans.iter() {
++                    let (min, max) = (fill.min.max(from), fill.max.min(span.min));
++                    if min < max {
++                        out.push(Span { min, max, ..*fill });
++                    }
++                }
++            }
++            out.push(*span);
++        }
++        out.surface = most.surface;
++        out
++    }
++    /// The spans a footprint's sorted span edges give where at least `needed` of its columns
++    /// hold a block, in the material most of them hold there.
++    fn sweep(events: &[(i16, (BlockStateId, u16, u16), i32)], needed: i32) -> Self {
+         let mut result = Self::default();
+         let mut votes = Vec::<((BlockStateId, u16), i32)>::new();
+         let mut sky = [0i32; 16];
+         let mut block = [0i32; 16];
+         let mut occupied = 0;
+         let mut bottom = MIN_Y as i16;
+-        for (y, material, change) in events {
++        for &(y, material, change) in events {
+             if bottom < y {
+-                if occupied > 0
++                if occupied >= needed
+                     && let Some(&((state, biome), _)) =
+                         votes.iter().max_by_key(|&(material, count)| {
+                             (*count, std::cmp::Reverse((material.0.0, material.1)))
+@@ -3797,10 +3829,28 @@ mod tests {
+             [span(0, 4, 1), span(4, 12, 2), span(12, 14, 3)]
+         );
+         assert_eq!(reduced.get(4, 8, 4).spans, [span(0, 4, 1)]);
++        // One tree in a corner of a 16-wide cell (16 of its 256 columns) is not the cell's: it
++        // made a 16x16 box of leaves from afar (user, 2026-11-14).
+         assert_eq!(
+             reduced.get(0, 0, 16).spans,
++            [span(0, 4, 1)],
++            "one small crown does not cover a whole wide cell"
++        );
++        // A crown over a quarter of the cell or more is drawn, on its trunk.
++        let mut columns = std::array::from_fn(|_| Column {
++            surface: None,
++            spans: vec![span(0, 4, 1)].into(),
++        });
++        columns[0].spans.push(span(4, 12, 2));
++        for z in 0..8 {
++            for x in 0..8 {
++                columns[z * 16 + x].spans.push(span(12, 14, 3));
++            }
++        }
++        assert_eq!(
++            Column::reduced(&columns, 0, 0, 16).spans,
+             [span(0, 4, 1), span(4, 12, 2), span(12, 14, 3)],
+-            "a crown over one corner of a wide cell still sits on its trunk"
++            "a crown over a quarter of a wide cell still sits on its trunk"
+         );
+     }
+     /// A chunk is reduced to the one cell width that reads it, when it does.
+diff --git a/crates/horizon-client/src/vanillagen/lod/vegetation.rs b/crates/horizon-client/src/vanillagen/lod/vegetation.rs
+index 0d460d77b3..cd71cc0565 100644
+--- a/crates/horizon-client/src/vanillagen/lod/vegetation.rs
++++ b/crates/horizon-client/src/vanillagen/lod/vegetation.rs
+@@ -349,15 +349,20 @@ impl Vegetation {
+                 - (-total * f64::from(tree.radius * tree.radius) * std::f64::consts::PI / 256.)
+                     .exp();
+             if coverage >= 0.25 {
++                // A wide cell is one block-textured box: its crown as high as a full tree drew
++                // 16x16 slabs of leaves over every wooded cell, the square boxes of far forests
++                // (user, 2026-11-14). The box is as high as the cell's trees are on average: full
++                // crown height where they close the canopy, lower as they thin out, so a forest
++                // reads as rolling treetops and a sparse one as ground with low cover.
+                 let height = tree.height + ((n >> 32) & 1) as i32;
+-                // The cell's representative tree stands in it: its trunk
+-                // is drawn under the crown.
+-                best = Some((
+-                    surface.height + height.max(4),
+-                    surface.height + height.max(4) - tree.radius * 2,
+-                    *tree,
+-                    true,
+-                ));
++                let full = surface.height + height.max(4);
++                let ground = surface.height + 1;
++                let top = ground + ((full - ground) as f64 * coverage.min(1.0)).round() as i32;
++                // Varied a block or two between cells, as treetops are.
++                let top = top - ((n >> 40) % 3) as i32 + 1;
++                if top > ground {
++                    best = Some((top, (top - tree.radius * 2).max(ground), *tree, true));
++                }
+             }
+         } else {
+             let radius = trees.iter().map(|t| t.radius).max().unwrap_or(2);
+-- 
+2.56.0.windows.2
+

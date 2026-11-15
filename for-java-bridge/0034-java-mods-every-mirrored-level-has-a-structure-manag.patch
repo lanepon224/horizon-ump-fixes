@@ -1,0 +1,53 @@
+From c66a461e74e121c21188ed0d18cb3e4a06641992 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 34/90] java mods: every mirrored level has a structure manager
+
+A level the mods generate got its StructureManager with its generation (HorizonWorldgen.readyLevel); one Horizon generates had none, and mods asking it where structures are failed every tick: Lithostitched's StructureAttributeHandler on START_LEVEL_TICK, Incendium's location predicates in its clock functions (237 errors a minute with UMP's 100 mods). Each level now gets one at creation, with a structure check that scans none of Horizon's chunks (Horizon places structures there). UMP gap run, 100 mods: 0 such errors. 75/75 tests.
+---
+ .../horizonlab/platform/HorizonServer.java    | 29 +++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index a2f6d3727b..5ca6b943d5 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -661,6 +661,35 @@ public final class HorizonServer {
+                         Natives.log("Java mods: a level has no environment attributes: " + e);
+                     }
+                 });
++                // Its structure manager, which a level the mods generate gets with its generation
++                // (HorizonWorldgen.readyLevel). A level Horizon generates had none, and every mod
++                // asking it where a structure is (Lithostitched's tick, Incendium's location
++                // predicates) failed each tick: one over a check that finds no structures (Horizon
++                // places them there; none are in the mirror's chunks). (UMP, 2026-11-12)
++                try {
++                    java.lang.reflect.Field manager = ServerLevel.class.getDeclaredField("structureManager");
++                    manager.setAccessible(true);
++                    if (manager.get(level) == null && server != null && server.getWorldGenSettings() != null) {
++                        net.minecraft.world.level.chunk.storage.ChunkScanAccess none =
++                                (pos, visitor) -> java.util.concurrent.CompletableFuture.completedFuture(null);
++                        var generator = HorizonServer.generator(level);
++                        if (generator != null) {
++                            var settings = generator instanceof net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator noise
++                                    ? noise.generatorSettings().value()
++                                    : registries.lookupOrThrow(Registries.NOISE_SETTINGS)
++                                            .getOrThrow(net.minecraft.world.level.levelgen.NoiseGeneratorSettings.OVERWORLD).value();
++                            var random = net.minecraft.world.level.levelgen.RandomState.create(
++                                    registries.lookupOrThrow(Registries.NOISE), seed, settings);
++                            var check = new net.minecraft.world.level.levelgen.structure.StructureCheck(none, registries,
++                                    server.getStructureTemplateManager(), k, generator, random,
++                                    level, generator.getBiomeSource(), seed, server.getFixerUpper());
++                            manager.set(level, new net.minecraft.world.level.StructureManager(level,
++                                    server.getWorldGenSettings().options(), check));
++                        }
++                    }
++                } catch (ReflectiveOperationException | RuntimeException e) {
++                    Natives.log("Java mods: a level has no structure manager: " + e);
++                }
+             }
+             return level;
+         });
+-- 
+2.56.0.windows.2
+

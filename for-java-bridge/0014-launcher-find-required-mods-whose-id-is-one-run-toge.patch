@@ -1,0 +1,58 @@
+From bb09073b520d8b2a6cf6beeecba0620f8b323873 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 14/90] launcher: find required mods whose id is one
+ run-together word
+
+Modrinth's search finds nothing for 'forgeconfigapiport' (its name is 'Forge Config API Port'): the lookup now also searches the id's leading parts and matches names with spaces, dots, dashes and underscores removed. Found by UMP's new-player UX test: Traveler's Backpack alone stopped the game for its missing library.
+---
+ launcher/src/java_deps.rs | 33 +++++++++++++++++++++++----------
+ 1 file changed, 23 insertions(+), 10 deletions(-)
+
+diff --git a/launcher/src/java_deps.rs b/launcher/src/java_deps.rs
+index 047de76734..5818f7388f 100644
+--- a/launcher/src/java_deps.rs
++++ b/launcher/src/java_deps.rs
+@@ -225,16 +225,29 @@ fn find(source: &dyn Source, id: &str) -> Result<(browser::Project, browser::Ver
+         }
+     }
+     if project.is_none() {
+-        let mut q = browser::Query::new(id, Kind::Mod);
+-        q.limit = 10;
+-        let norm = |s: &str| s.to_ascii_lowercase().replace(['-', '_', ' ', '\''], "");
+-        project = source
+-            .search(&q)?
+-            .into_iter()
+-            .find(|p| {
+-                let (slug, title, id) = (norm(&p.slug), norm(&p.title), norm(id));
+-                slug == id || title == id || slug == format!("{id}api") || title == format!("{id}api")
+-            });
++        let norm = |s: &str| s.to_ascii_lowercase().replace(['-', '_', ' ', '\'', '.'], "");
++        let want = norm(id);
++        // A search for an id written as one word ("forgeconfigapiport") finds nothing on
++        // Modrinth, whose names have spaces ("Forge Config API Port"): its leading part does.
++        let mut queries = vec![id.replace(['_', '-'], " ")];
++        for cut in [want.len() * 2 / 3, 8, 5] {
++            if cut >= 4 && cut < want.len() && want.is_char_boundary(cut) {
++                queries.push(want[..cut].to_string());
++            }
++        }
++        queries.dedup();
++        'search: for text in queries {
++            let mut q = browser::Query::new(&text, Kind::Mod);
++            q.limit = 20;
++            for p in source.search(&q).unwrap_or_default() {
++                let (slug, title) = (norm(&p.slug), norm(&p.title));
++                let api = format!("{want}api");
++                if slug == want || title == want || slug == api || title == api {
++                    project = Some(p);
++                    break 'search;
++                }
++            }
++        }
+     }
+     let project = project.ok_or_else(|| "not found on Modrinth".to_string())?;
+     let version = source
+-- 
+2.56.0.windows.2
+

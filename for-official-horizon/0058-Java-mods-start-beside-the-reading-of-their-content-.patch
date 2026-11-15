@@ -1,0 +1,53 @@
+From 1ed0d293b8ae328dc0990f12ae47fb915fa072fc Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 58/90] Java mods start beside the reading of their content
+ when it was built before
+
+start_early ran after content_root had read every mod's content (40 s with 184 mods), and Java's own start (mixins, the mods' entrypoints: about 90 s) then ran into the world's open, which waits for it. With a content root built before (its stamp is there), Java starts right after the Java mods' content is found, beside that reading.
+
+UMP, 184 mods, warm start on an SSD: Java's start at 3 s instead of 41 s; ready 143 -> 127-131 s, join 70-72 -> 44-45 s.
+---
+ crates/horizon-client/src/game/mods.rs   | 12 ++++++++++++
+ crates/horizon-client/src/mod_content.rs |  2 ++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/crates/horizon-client/src/game/mods.rs b/crates/horizon-client/src/game/mods.rs
+index 4cfd0be3c2..c450a57e01 100644
+--- a/crates/horizon-client/src/game/mods.rs
++++ b/crates/horizon-client/src/game/mods.rs
+@@ -83,6 +83,18 @@ pub(super) fn content_root(
+     // The Java mods' content mods are always on, as dev mods are (the jars in mods-java/ are
+     // what turns them on and off).
+     let java = horizon_client::spans::startup::time("content.java_content", || super::java_mods::java_content(root));
++    // A content root built before (its stamp is there): Java and Fabric start now, beside the
++    // reading of the mods' content below (40 s with a big pack), not after it; their start
++    // (90 s with 184 mods: mixins and the mods' entrypoints) is what a world's join waits for.
++    // When the root must be built again after all, the build runs beside Java's start, which
++    // only costs memory. (UMP, 2026-11-14)
++    if horizon_cache()
++        .join("mod-content")
++        .join(horizon_client::mod_content::STAMP_FILE)
++        .is_file()
++    {
++        super::java_mods::start_early();
++    }
+     let dev = &[dev, java.as_slice()].concat();
+     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
+     paths.retain(|p| !dev.contains(p));
+diff --git a/crates/horizon-client/src/mod_content.rs b/crates/horizon-client/src/mod_content.rs
+index 86131a9c2e..5267d18407 100644
+--- a/crates/horizon-client/src/mod_content.rs
++++ b/crates/horizon-client/src/mod_content.rs
+@@ -2982,6 +2982,8 @@ const WARNINGS: &str = "horizon-mod-content-warnings.txt";
+ 
+ /// In a root built by [`resource_root`]: what it was built from.
+ const STAMP: &str = "horizon-mod-content.stamp";
++/// [`STAMP`]'s name: whether a content root was built before.
++pub const STAMP_FILE: &str = STAMP;
+ 
+ /// What a content root is built from: this build of the game, the base's
+ /// manifest and the tables [`build`] rewrites, and every file of every mod
+-- 
+2.56.0.windows.2
+

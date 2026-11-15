@@ -1,0 +1,127 @@
+From 61b056fd00d4b33cc439f60fb4ba5dd567ac4c4a Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 64/90] Mirror connections complete enough for mods; device-mod
+ scan kept on disk
+
+The server's mirror connection for a joining player had no channel: Multiloader Data Extensions' data-map reply (connection.channel.pipeline()) failed its configuration task. It gets the closed memory channel the client's connection has. The headless client's connection, made without its constructor, lacked the mixins' fields: Fabric's packet context, which Female Gender's version check asks for as the client joins (NPE in ClientPlayConnectionEvents.INIT). Its fields are made as the server's are.
+
+HorizonDeviceMods' scan (every class of every mod read for microphone use, ~20 s with 182 jars) is kept in .horizon-cache by the set of mods' ids, versions and jar sizes/times.
+
+UMP, 184 mods: no pipeline/PacketContext NPEs; warm start 94-99 s.
+---
+ .../platform/HorizonConfiguration.java        | 11 ++++
+ .../platform/HorizonDeviceMods.java           | 53 +++++++++++++++++++
+ .../horizonlab/platform/HorizonServer.java    |  9 +++-
+ 3 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonConfiguration.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonConfiguration.java
+index e6eb01ee76..e8fb222a02 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonConfiguration.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonConfiguration.java
+@@ -62,6 +62,17 @@ public final class HorizonConfiguration {
+                 if (SET_UP.add(connection)) {
+                     HorizonHooks.initFields(connection);
+                     HorizonHooks.constructed(connection);
++                    // A closed memory channel, as the client's connection has (HorizonClient.memoryConnection):
++                    // mods reach the connection's channel while configuring (Multiloader Data Extensions'
++                    // data-map reply: connection.channel.pipeline()), and a null one failed their task.
++                    // (UMP, 2026-11-14)
++                    try {
++                        Field ch = net.minecraft.network.Connection.class.getDeclaredField("channel");
++                        ch.setAccessible(true);
++                        if (ch.get(connection) == null) HorizonClient.memoryConnection(connection);
++                    } catch (ReflectiveOperationException e) {
++                        Natives.log("Java mods: a joining player's connection has no channel: " + e);
++                    }
+                 }
+             }
+             var listener = new ServerConfigurationPacketListenerImpl(server, connection,
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonDeviceMods.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonDeviceMods.java
+index 24bb6c5e47..54fdac8421 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonDeviceMods.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonDeviceMods.java
+@@ -130,7 +130,60 @@ public final class HorizonDeviceMods {
+         }
+     }
+ 
++    /**
++     * The scan's result kept on disk by the set of mods (their ids, versions and jar sizes and
++     * times): reading every class of every mod (182 jars, ~20 s) on each start ran on the main
++     * thread when the first mod handler asked before the background scan ended. (UMP, 2026-11-14)
++     */
++    private static Path cacheFile() {
++        StringBuilder key = new StringBuilder("v1");
++        var all = new java.util.ArrayList<>(FabricLoader.getInstance().getAllMods());
++        all.sort(java.util.Comparator.comparing(m -> m.getMetadata().getId()));
++        for (var mod : all) {
++            key.append('|').append(mod.getMetadata().getId()).append(' ').append(mod.getMetadata().getVersion().getFriendlyString());
++            for (Path p : mod.getOrigin().getKind() == net.fabricmc.loader.api.metadata.ModOrigin.Kind.PATH
++                    ? mod.getOrigin().getPaths() : java.util.List.<Path>of()) {
++                try {
++                    key.append(' ').append(Files.size(p)).append(' ').append(Files.getLastModifiedTime(p).toMillis());
++                } catch (java.io.IOException | UnsupportedOperationException e) {
++                    // a folder or a nested jar: its id and version stand for it
++                }
++            }
++        }
++        String hash = Integer.toHexString(key.toString().hashCode()) + Integer.toHexString(key.length());
++        return FabricLoader.getInstance().getGameDir().resolve(".horizon-cache").resolve("device-mods-" + hash + ".txt");
++    }
++
+     private static Set<String> scanNow() {
++        Path cache = null;
++        try {
++            cache = cacheFile();
++            if (Files.isRegularFile(cache)) {
++                Set<String> read = new TreeSet<>();
++                for (String line : Files.readAllLines(cache, StandardCharsets.UTF_8)) {
++                    if (!line.isBlank()) read.add(line.trim());
++                }
++                return java.util.Collections.unmodifiableSet(read);
++            }
++        } catch (Throwable t) {
++            cache = null;
++        }
++        Set<String> found = scanJars();
++        if (cache != null) {
++            try {
++                Files.createDirectories(cache.getParent());
++                try (var old = Files.newDirectoryStream(cache.getParent(), "device-mods-*.txt")) {
++                    for (Path p : old) Files.deleteIfExists(p);
++                }
++                Files.write(cache, found, StandardCharsets.UTF_8);
++            } catch (Throwable t) {
++                // only costs the next start the scan
++            }
++        }
++        return found;
++    }
++
++    private static Set<String> scanJars() {
+         Set<String> out = new TreeSet<>();
+         byte[][] needles = new byte[DEVICE_CALLS.length][];
+         for (int i = 0; i < needles.length; i++) needles[i] = DEVICE_CALLS[i].getBytes(StandardCharsets.UTF_8);
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index 5da6806332..31952bf16e 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -257,7 +257,14 @@ public final class HorizonServer {
+ 
+     /** The headless client's network connection (its packet listener's): a mirror one. */
+     static synchronized net.minecraft.network.Connection clientConnection() {
+-        if (clientConnection == null) clientConnection = HorizonClient.memoryConnection(allocate(net.minecraft.network.Connection.class));
++        if (clientConnection == null) {
++            var connection = allocate(net.minecraft.network.Connection.class);
++            // Made without its constructor: the mods' fields on it (Fabric's packet context, which
++            // Female Gender asks for its version as the client joins) are made as at its end.
++            // (UMP, 2026-11-14)
++            HorizonHooks.initFields(connection);
++            clientConnection = HorizonClient.memoryConnection(connection);
++        }
+         return clientConnection;
+     }
+ 
+-- 
+2.56.0.windows.2
+

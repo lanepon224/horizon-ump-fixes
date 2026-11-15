@@ -1,0 +1,172 @@
+From 65a4e1ca528900a7ae8e6ed3dc3c72bfed9508b8 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 31/90] java mods: structure templates brought up to date are
+ kept on disk
+
+Mods ship structure templates from many older DataVersions, and each was updated by DataFixerUpper whenever it was loaded (the bridge also lets the fixer's rule caches go every few chains, to bound its memory): hundreds of ms a template on the worldgen threads while flying (UMP stack samples: DataFixTypes.update under TemplateSource.readStructure). TemplateSource.readStructure's update now goes through HorizonTemplateCache: the updated tag is kept in <bridge work>/template-cache/<data version>/ by the SHA-256 of the original, so a template is updated once. Current templates are untouched; anything that fails falls back to the fixer. The JVM gets the work folder as -Dhorizon.work.
+
+UMP perf_test, 100 mods, LOD 512, second run with the cache: Java mirror tick 345 ms in the worldgen peak (was 700-990), structure_references 165 ms each (was 440-640), far terrain filled in 107 s (was 164-194); 205 templates cached (1 MB). 75/75 tests.
+---
+ .../platform/HorizonTemplateCache.java        | 81 +++++++++++++++++++
+ .../platform/mixin/TemplateCacheMixin.java    | 26 ++++++
+ .../platform/horizon-platform.mixins.json     |  1 +
+ crates/horizon-jvm/src/lib.rs                 |  4 +-
+ 4 files changed, 111 insertions(+), 1 deletion(-)
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonTemplateCache.java
+ create mode 100644 crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplateCacheMixin.java
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonTemplateCache.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonTemplateCache.java
+new file mode 100644
+index 0000000000..d7ffc88b3d
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonTemplateCache.java
+@@ -0,0 +1,81 @@
++package dev.horizonlab.platform;
++
++import com.mojang.datafixers.DataFixer;
++import dev.horizonlab.bridge.Natives;
++import java.io.ByteArrayOutputStream;
++import java.io.DataOutputStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.security.MessageDigest;
++import net.minecraft.SharedConstants;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.nbt.NbtAccounter;
++import net.minecraft.nbt.NbtIo;
++import net.minecraft.util.datafix.DataFixTypes;
++
++/**
++ * Structure templates brought up to the current DataVersion, kept in {@code <horizon.work>/
++ * template-cache/<game data version>/} by the SHA-256 of the original tag: a template a mod ships
++ * from an older version is updated by DataFixerUpper once, not each time it is loaded. A current
++ * template isn't touched. Anything that fails falls back to the fixer, as vanilla does.
++ */
++public final class HorizonTemplateCache {
++    private HorizonTemplateCache() {}
++
++    private static final Path DIR;
++    private static volatile int hits, misses;
++
++    static {
++        String work = System.getProperty("horizon.work");
++        Path dir = null;
++        if (work != null) {
++            dir = Path.of(work, "template-cache", String.valueOf(SharedConstants.getCurrentVersion().dataVersion().version()));
++            try {
++                Files.createDirectories(dir);
++            } catch (Exception e) {
++                dir = null;
++            }
++        }
++        DIR = dir;
++    }
++
++    public static CompoundTag update(DataFixTypes type, DataFixer fixer, CompoundTag tag, int version) {
++        int current = SharedConstants.getCurrentVersion().dataVersion().version();
++        if (DIR == null || version >= current) return type.updateToCurrentVersion(fixer, tag, version);
++        Path file = null;
++        try {
++            file = DIR.resolve(key(tag) + ".nbt");
++            if (Files.isRegularFile(file)) {
++                CompoundTag cached = NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap());
++                if (++hits == 1) Natives.log("Java mods: structure templates updated before are read from " + DIR);
++                return cached;
++            }
++        } catch (Throwable t) {
++            // Unreadable: updated again below and written over.
++        }
++        CompoundTag updated = type.updateToCurrentVersion(fixer, tag, version);
++        if (file != null) {
++            try {
++                Path part = file.resolveSibling(file.getFileName() + "." + Thread.currentThread().threadId() + ".part");
++                NbtIo.writeCompressed(updated, part);
++                Files.move(part, file, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
++                misses++;
++            } catch (Throwable t) {
++                // Kept only in memory this time.
++            }
++        }
++        return updated;
++    }
++
++    /** The SHA-256 of the tag as written, in hex. */
++    private static String key(CompoundTag tag) throws Exception {
++        ByteArrayOutputStream bytes = new ByteArrayOutputStream(8192);
++        try (DataOutputStream out = new DataOutputStream(bytes)) {
++            NbtIo.write(tag, out);
++        }
++        byte[] hash = MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray());
++        StringBuilder hex = new StringBuilder(64);
++        for (byte b : hash) hex.append(Character.forDigit((b >> 4) & 15, 16)).append(Character.forDigit(b & 15, 16));
++        return hex.toString();
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplateCacheMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplateCacheMixin.java
+new file mode 100644
+index 0000000000..ce99f26689
+--- /dev/null
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TemplateCacheMixin.java
+@@ -0,0 +1,26 @@
++package dev.horizonlab.platform.mixin;
++
++import dev.horizonlab.platform.HorizonTemplateCache;
++import net.minecraft.nbt.CompoundTag;
++import net.minecraft.util.datafix.DataFixTypes;
++import com.mojang.datafixers.DataFixer;
++import net.minecraft.world.level.levelgen.structure.templatesystem.loader.TemplateSource;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Redirect;
++
++/**
++ * A structure template of an older DataVersion (mods ship them by the thousand, from many
++ * versions) is brought up to date by DataFixerUpper each time it is loaded: hundreds of ms for
++ * one, as structures generate (UMP profile, 100 mods: worldgen threads in DataFixTypes.update).
++ * The updated tag is kept on disk by the original's content (HorizonTemplateCache), so the next
++ * load (later chunks, the next start) reads it as current. (UMP, 2026-11-12)
++ */
++@Mixin(TemplateSource.class)
++public abstract class TemplateCacheMixin {
++    @Redirect(method = "readStructure(Lnet/minecraft/nbt/CompoundTag;)Lnet/minecraft/world/level/levelgen/structure/templatesystem/StructureTemplate;",
++            at = @At(value = "INVOKE", target = "Lnet/minecraft/util/datafix/DataFixTypes;updateToCurrentVersion(Lcom/mojang/datafixers/DataFixer;Lnet/minecraft/nbt/CompoundTag;I)Lnet/minecraft/nbt/CompoundTag;"))
++    private CompoundTag horizon$cachedUpdate(DataFixTypes type, DataFixer fixer, CompoundTag tag, int version) {
++        return HorizonTemplateCache.update(type, fixer, tag, version);
++    }
++}
+diff --git a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+index fcdb78e26f..67265e49c0 100644
+--- a/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
++++ b/crates/horizon-jvm/java/platform/horizon-platform.mixins.json
+@@ -5,6 +5,7 @@
+   "compatibilityLevel": "JAVA_21",
+   "mixins": [
+     "EntityAccess",
++    "TemplateCacheMixin",
+     "ServerCommonListenerAccess",
+     "PlayerListAccess",
+     "MinecraftServerAccess",
+diff --git a/crates/horizon-jvm/src/lib.rs b/crates/horizon-jvm/src/lib.rs
+index 6fffb04f58..80516ac54a 100644
+--- a/crates/horizon-jvm/src/lib.rs
++++ b/crates/horizon-jvm/src/lib.rs
+@@ -388,12 +388,14 @@ pub fn start(config: &Config) -> Result<&'static Bridge, String> {
+     }
+     class_path.extend(config.class_path.iter().cloned());
+     let log_config = write_jar(&config.work, "log4j2-horizon.xml", LOG4J_CONFIG.as_bytes())?;
++    // Where Java may keep files between runs (the converted structure templates of mods).
++    let work_property = format!("-Dhorizon.work={}", option_path(&config.work)?.display());
+     let vm = create_vm(
+         &config.home,
+         &class_path,
+         config.class_archive.as_deref(),
+         &log_config,
+-        &[],
++        &[work_property],
+     )?;
+     let mut env = vm
+         .attach_current_thread_permanently()
+-- 
+2.56.0.windows.2
+

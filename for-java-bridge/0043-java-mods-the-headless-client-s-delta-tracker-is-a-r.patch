@@ -1,0 +1,56 @@
+From e21557745f22846f2027468c91f3d7cd37f487ba Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 43/90] java mods: the headless client's delta tracker is a
+ real Timer
+
+Minecraft.deltaTracker is a DeltaTracker.Timer, and mods cast it (Paladin's Furniture calls Timer.updatePauseState); DeltaTracker.ONE, another class, failed the cast and stopped Fabric's start. getDeltaTracker now gives a Timer that is never advanced, its deltas one whole tick as ONE's.
+---
+ .../platform/mixin/MinecraftCameraMixin.java  | 29 +++++++++++++++++--
+ 1 file changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/MinecraftCameraMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/MinecraftCameraMixin.java
+index ed29dcea87..d35a8d9674 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/MinecraftCameraMixin.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/MinecraftCameraMixin.java
+@@ -21,10 +21,35 @@ public abstract class MinecraftCameraMixin {
+         if (HorizonClient.headless()) cir.setReturnValue(((Minecraft) (Object) this).player);
+     }
+ 
+-    /** No frames, so no partial ticks: whole ticks (DeltaTracker.ONE). */
++    /**
++     * No frames, so no partial ticks: whole ticks. A real Timer, the type vanilla's field has (mods
++     * cast to it: Paladin's Furniture calls Timer.updatePauseState, and DeltaTracker.ONE, another
++     * class, failed the cast and stopped Fabric's start). It is never advanced, so its deltas stay
++     * one tick and its partial tick a whole one, as ONE's. (UMP, 2026-11-13)
++     */
+     @Inject(method = "getDeltaTracker", at = @At("HEAD"), cancellable = true)
+     private void horizon$deltaTracker(CallbackInfoReturnable<DeltaTracker> cir) {
+-        if (HorizonClient.headless()) cir.setReturnValue(DeltaTracker.ONE);
++        if (HorizonClient.headless()) cir.setReturnValue(WHOLE_TICKS);
++    }
++
++    private static final DeltaTracker.Timer WHOLE_TICKS = wholeTicks();
++
++    private static DeltaTracker.Timer wholeTicks() {
++        DeltaTracker.Timer timer = new DeltaTracker.Timer(20.0F, 0L, mspt -> mspt);
++        // Its fields as one whole tick: what ONE answers.
++        try {
++            for (String name : new String[] {"deltaTicks", "realtimeDeltaTicks"}) {
++                var field = DeltaTracker.Timer.class.getDeclaredField(name);
++                field.setAccessible(true);
++                field.setFloat(timer, 1.0F);
++            }
++            var residual = DeltaTracker.Timer.class.getDeclaredField("deltaTickResidual");
++            residual.setAccessible(true);
++            residual.setFloat(timer, 1.0F);
++        } catch (ReflectiveOperationException e) {
++            // Fields renamed: its deltas start at 0, the partial tick too.
++        }
++        return timer;
+     }
+ 
+     /**
+-- 
+2.56.0.windows.2
+

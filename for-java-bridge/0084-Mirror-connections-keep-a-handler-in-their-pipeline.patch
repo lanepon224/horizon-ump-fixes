@@ -1,0 +1,38 @@
+From 3e39d6616e9f543070438d22990a7b32bd18521b Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 84/90] Mirror connections keep a handler in their pipeline
+
+Mods keep per-connection state on the pipeline's last handler context: Multiloader Data Extensions' known-data-maps reply (pipeline().lastContext().attr(...)) got null from the mirror's empty memory channel, failed every player's configuration and said so in chat. The memory channel now holds a do-nothing handler, as a real connection's packet handler sits there.
+
+UMP 184 mods: the configuration failure is gone (0 log lines, no chat message).
+---
+ .../dev/horizonlab/platform/HorizonClient.java        | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index b3db888b83..74becb107b 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -1121,7 +1121,18 @@ public final class HorizonClient {
+         };
+         channel.remoteAddress();
+         channel.localAddress();
++        // A handler stays in its pipeline, as a real connection's packet handler does: mods keep
++        // per-connection state on the pipeline's last handler context (Multiloader Data
++        // Extensions' known data maps: pipeline().lastContext().attr(...), null on an empty
++        // pipeline, which failed the player's configuration). Netty keeps handlers on a closed
++        // channel's pipeline only until it is deregistered, so it is added after close.
++        // (UMP, 2026-11-15)
+         channel.close();
++        try {
++            channel.pipeline().addLast("horizon_packet_handler", new io.netty.channel.ChannelInboundHandlerAdapter());
++        } catch (Throwable t) {
++            Natives.log("Horizon's client: its connection's pipeline has no handler: " + t);
++        }
+         try {
+             set(net.minecraft.network.Connection.class, connection, "channel", channel);
+         } catch (ReflectiveOperationException e) {
+-- 
+2.56.0.windows.2
+

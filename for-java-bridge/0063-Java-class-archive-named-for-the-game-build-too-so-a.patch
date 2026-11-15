@@ -1,0 +1,38 @@
+From 80041f4c2ce1ecd8683f5d7437487d97971bc827 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 63/90] Java class archive named for the game build too, so an
+ update writes a usable one
+
+The JVM maps a class archive only while its class path is the one it was written with, jar sizes and times included; the bridge's own jar changes with a game update and the archive named only by the mod jars stayed in place, silently unused ('shared class paths mismatch': 1,480 of 85,000 classes from it with 184 mods). The game's executable is now part of the archive's stamp: an update archives the classes again on its first quit.
+
+UMP, 184 mods: classes from the archive 1.5k -> 35k of 83k (Knot's mixed-in classes can't be archived); warm start ready 95-99 s (was 102-139 s).
+---
+ crates/horizon-client/src/game/java_mods/bridge.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client/src/game/java_mods/bridge.rs b/crates/horizon-client/src/game/java_mods/bridge.rs
+index 35504a75b4..710377d049 100644
+--- a/crates/horizon-client/src/game/java_mods/bridge.rs
++++ b/crates/horizon-client/src/game/java_mods/bridge.rs
+@@ -470,7 +470,16 @@ fn class_archive(jars: &[PathBuf]) -> Option<PathBuf> {
+         return None;
+     }
+     let cache = super::super::mods::horizon_cache();
+-    let name = format!("java-classes-{}.jsa", horizon_jvm::content::stamp(jars));
++    // The JVM maps an archive only while its class path is the one it was written with, jar
++    // sizes and times included (CDS's "shared class paths mismatch"); the bridge's own jar is
++    // rewritten by a game update, and the archive was then silently unused: 1,480 of 85,000
++    // classes came from it with 184 mods (UMP, 2026-11-14). This game build (its executable)
++    // is in the name, so an update archives the classes again.
++    let mut stamped = jars.to_vec();
++    if let Ok(exe) = std::env::current_exe() {
++        stamped.push(exe);
++    }
++    let name = format!("java-classes-{}.jsa", horizon_jvm::content::stamp(&stamped));
+     if let Ok(entries) = std::fs::read_dir(&cache) {
+         for entry in entries.flatten() {
+             let other = entry.file_name().to_string_lossy().into_owned();
+-- 
+2.56.0.windows.2
+

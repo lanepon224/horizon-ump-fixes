@@ -1,0 +1,51 @@
+From 85e9ef1044de27f8aef771d6c638003c4ee94e47 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 78/90] A world with no saved dimension opens without waiting
+ for the Java start
+
+level_named waited for the whole Java mods' start when the world's dimension was not a known level yet; a new world (or a level.dat without one) has an empty dimension, which is the Overworld either way. The wait held world.prepare 13.8 s with 184 mods; the step is now traced (world.level_named).
+
+UMP 184 mods: world.prepare 14.6 -> 5.7 s, but the spawn's settle now waits for the Java worldgen instead (12 s): ready median 69 s, join 38 s, unchanged. The Java start is the critical path.
+---
+ crates/horizon-client/src/game/java_mods/bridge.rs | 7 +++++++
+ crates/horizon-client/src/game/world_loading.rs    | 5 ++++-
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client/src/game/java_mods/bridge.rs b/crates/horizon-client/src/game/java_mods/bridge.rs
+index 710377d049..6f7cfa07fc 100644
+--- a/crates/horizon-client/src/game/java_mods/bridge.rs
++++ b/crates/horizon-client/src/game/java_mods/bridge.rs
+@@ -395,6 +395,13 @@ pub(in crate::game) fn level_named(id: &str) -> super::super::Dim {
+     if let Some(dim) = super::super::Dim::known(id) {
+         return dim;
+     }
++    // No dimension saved (a new world, or level.dat without a player): the overworld, which
++    // needs nothing from the mods. Waiting for their start here held the world's opening
++    // behind the whole Java start (UMP startup trace: world.level_named 13.8 s with 184 mods).
++    // (UMP, 2026-11-15)
++    if id.is_empty() {
++        return super::super::Dim::Overworld;
++    }
+     if has_java_mods() {
+         wait_for_java(std::time::Duration::from_secs(300));
+     }
+diff --git a/crates/horizon-client/src/game/world_loading.rs b/crates/horizon-client/src/game/world_loading.rs
+index 4a5ed0091f..0313d36042 100644
+--- a/crates/horizon-client/src/game/world_loading.rs
++++ b/crates/horizon-client/src/game/world_loading.rs
+@@ -232,7 +232,10 @@ impl WorldRequest {
+             level.position = None;
+         }
+         // A world saved in a mod's dimension waits for the mods to say what it is.
+-        let dim = super::java_mods::level_named(&level.dimension);
++        let dim = {
++            let _wait = startup::step("world.level_named");
++            super::java_mods::level_named(&level.dimension)
++        };
+         let shapes = level_shapes(&save_root, res.biomes());
+         let shape = shapes.get(dim.id());
+         let streaming_step = startup::step("world.make_streaming");
+-- 
+2.56.0.windows.2
+

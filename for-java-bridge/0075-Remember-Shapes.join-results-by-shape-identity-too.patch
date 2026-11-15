@@ -1,0 +1,84 @@
+From 0ed1625f444ac4b31ebebbe7d5ebbfb04148e25b Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 75/90] Remember Shapes.join results by shape identity too
+
+Snow! Real Magic's snowy fences and walls (over Diagonal Blocks') join the same parts again for every state in Kiwi's client start (UMP samples: ShapeCaches.get -> Shapes.or -> join -> optimize). Shapes.join's result is kept by the identity of its two shapes and the operation, as joinIsNotEmpty's already is: VoxelShapes are immutable, and vanilla shares instances (Shapes.block()).
+
+UMP 184 mods: 479k of 807k joins remembered; client entrypoints median 9.6 -> 6.6 s; ready/join medians 82/32 s (noise around 79/29).
+---
+ .../horizonlab/platform/HorizonShapeMemo.java | 20 ++++++++++++++++++-
+ .../platform/mixin/ShapesJoinMixin.java       | 14 +++++++++++++
+ 2 files changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
+index deb7527e74..e5ada98841 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonShapeMemo.java
+@@ -19,6 +19,9 @@ public final class HorizonShapeMemo {
+     private static final boolean ON = !"0".equals(System.getenv("HORIZON_SHAPE_MEMO"));
+     private static final int MAX = 2_000_000;
+     private static final ConcurrentHashMap<Key, Boolean> MEMO = new ConcurrentHashMap<>();
++    private static final ConcurrentHashMap<Key, VoxelShape> JOINS = new ConcurrentHashMap<>();
++    private static final LongAdder JOIN_HITS = new LongAdder();
++    private static final LongAdder JOIN_MISSES = new LongAdder();
+     private static final LongAdder HITS = new LongAdder();
+     private static final LongAdder MISSES = new LongAdder();
+ 
+@@ -48,12 +51,27 @@ public final class HorizonShapeMemo {
+         MEMO.put(new Key(first, second, op), value);
+     }
+ 
++    public static VoxelShape getJoin(VoxelShape first, VoxelShape second, BooleanOp op) {
++        if (!ON) return null;
++        VoxelShape known = JOINS.get(new Key(first, second, op));
++        if (known != null) JOIN_HITS.increment();
++        else JOIN_MISSES.increment();
++        return known;
++    }
++
++    public static void putJoin(VoxelShape first, VoxelShape second, BooleanOp op, VoxelShape value) {
++        if (!ON || value == null) return;
++        if (JOINS.size() >= MAX / 4) JOINS.clear();
++        JOINS.put(new Key(first, second, op), value);
++    }
++
+     /** One line: how often the memory answered (called after the mods' entrypoints). */
+     public static void report() {
+         long hits = HITS.sum(), misses = MISSES.sum();
+         if (hits + misses > 0) {
+             Natives.log("Java mods: shape joins remembered " + hits + " of " + (hits + misses)
+-                    + " times; " + MEMO.size() + " kept");
++                    + " times; " + MEMO.size() + " kept; joined shapes " + JOIN_HITS.sum() + " of "
++                    + (JOIN_HITS.sum() + JOIN_MISSES.sum()) + "; " + JOINS.size() + " kept");
+         }
+     }
+ }
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
+index 4448b0af61..8b773d155d 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/ShapesJoinMixin.java
+@@ -25,6 +25,20 @@ public abstract class ShapesJoinMixin {
+         if (known != null) info.setReturnValue(known);
+     }
+ 
++    /** Shapes.join (an optimized new shape) the same way: block shapes are joined from the same parts again and again (Snow! Real Magic's snowy fences and walls, Diagonal Blocks'). */
++    @Inject(method = "join(Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/BooleanOp;)Lnet/minecraft/world/phys/shapes/VoxelShape;",
++            at = @At("HEAD"), cancellable = true)
++    private static void horizon$rememberedJoin(VoxelShape first, VoxelShape second, BooleanOp op, CallbackInfoReturnable<VoxelShape> info) {
++        VoxelShape known = HorizonShapeMemo.getJoin(first, second, op);
++        if (known != null) info.setReturnValue(known);
++    }
++
++    @Inject(method = "join(Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/BooleanOp;)Lnet/minecraft/world/phys/shapes/VoxelShape;",
++            at = @At("RETURN"))
++    private static void horizon$rememberJoin(VoxelShape first, VoxelShape second, BooleanOp op, CallbackInfoReturnable<VoxelShape> info) {
++        HorizonShapeMemo.putJoin(first, second, op, info.getReturnValue());
++    }
++
+     @Inject(method = "joinIsNotEmpty(Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/VoxelShape;Lnet/minecraft/world/phys/shapes/BooleanOp;)Z",
+             at = @At("RETURN"))
+     private static void horizon$remember(VoxelShape first, VoxelShape second, BooleanOp op, CallbackInfoReturnable<Boolean> info) {
+-- 
+2.56.0.windows.2
+

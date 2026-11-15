@@ -1,0 +1,305 @@
+From d93668e114e5548da76eb305dc1d87c99bb20fed Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 49/90] Far terrain draws snow: snow layers of saved chunks and
+ the climate's snow on generated far land
+
+A snow layer is thin and not kept in far columns, so the grass under it showed and far snowy plains and peaks came out green. Saved chunks' columns now draw a snow layer as the snow block's top on the ground under it (Column::from_chunk, with its test), and land sampled straight from the generator (no decoration) gets the snow block's top where freeze_top_layer would lay snow: the biome has precipitation and is cold enough at that height (FarSnow).
+
+UMP: snowy plains seen from 140 high, far band white share 0.02 -> 0.26 (ump/scripts/snow_check.ps1).
+---
+ crates/horizon-client-render/src/lod.rs     | 83 +++++++++++++++++-
+ crates/horizon-client/src/vanillagen/lod.rs | 93 +++++++++++++++++++++
+ 2 files changed, 173 insertions(+), 3 deletions(-)
+
+diff --git a/crates/horizon-client-render/src/lod.rs b/crates/horizon-client-render/src/lod.rs
+index 0650c09c18..6743bbe9c9 100644
+--- a/crates/horizon-client-render/src/lod.rs
++++ b/crates/horizon-client-render/src/lod.rs
+@@ -417,10 +417,13 @@ impl Column {
+         chunk: &Chunk,
+         kinds: &[u8],
+         water: Option<BlockStateId>,
++        snow: &Snow,
+         x: i32,
+         z: i32,
+     ) -> Self {
+         let kind = |state: BlockStateId| kinds.get(state.0 as usize).copied().unwrap_or(0);
++        let kind_of = kind;
++        let snow_block = snow.block;
+         let face_light = |y: i32| {
+             let mut sky = 0;
+             let mut block = 0;
+@@ -456,6 +459,29 @@ impl Column {
+                 let y = min + offset;
+                 let mut state = BlockStateId(chunk.get(x, y, z));
+                 let mut kind = kind(state);
++                if snow.layers.contains(&state.0) {
++                    // The snow layer stands for the snow block on the run below it: its top
++                    // face draws snow, the run's height unchanged.
++                    if let Some(snow) = snow_block
++                        && let Some(top) = column.spans.0.last_mut()
++                        && i32::from(top.max) == y
++                        && kind_of(top.state) & FLUID == 0
++                    {
++                        if top.max - top.min > 1 {
++                            top.max -= 1;
++                            let under = *top;
++                            column.push(Span {
++                                min: under.max,
++                                max: under.max + 1,
++                                state: snow,
++                                ..under
++                            });
++                        } else {
++                            top.state = snow;
++                        }
++                    }
++                    continue;
++                }
+                 if kind & KEPT == 0 {
+                     continue;
+                 }
+@@ -507,8 +533,10 @@ impl Column {
+ /// A chunk's 256 columns (`Column::from_chunk`), on the far-terrain worker.
+ pub(crate) fn summarize(chunk: &Chunk, kinds: &[u8]) -> Arc<[Column; 256]> {
+     let water = water_source(kinds);
++    let none = Snow::default();
++    let snow = SNOW.get().unwrap_or(&none);
+     Arc::new(std::array::from_fn(|i| {
+-        Column::from_chunk(chunk, kinds, water, (i & 15) as i32, (i >> 4) as i32)
++        Column::from_chunk(chunk, kinds, water, snow, (i & 15) as i32, (i >> 4) as i32)
+     }))
+ }
+ /// The water source state: the first plain kept fluid without light
+@@ -528,9 +556,36 @@ const AIR: u8 = 4;
+ /// waterlogged blocks that aren't kept): far terrain draws water there, or
+ /// kelp reaching the surface leaves holes in the sea.
+ const WATERY: u8 = 8;
++/// The snow layer and the snow block, by state (`snow_states`): far terrain draws a snow
++/// layer as the snow block's top on the ground under it. At a distance it is the ground's
++/// colour; left out, the grass under the snow showed and far snowy plains and mountains came
++/// out green. The kinds' high nibble is the light emission, so these are kept apart.
++/// (UMP, 2026-11-13)
++static SNOW: std::sync::OnceLock<Snow> = std::sync::OnceLock::new();
++/// The snow layer states and the snow block, for `Column::from_chunk`.
++#[derive(Default)]
++pub(crate) struct Snow {
++    layers: FxHashSet<u32>,
++    block: Option<BlockStateId>,
++}
+ /// What `Column::from_chunk` needs of each block state, read from the facts
+ /// once: matching their names for every block made observing a chunk slow.
+ pub(crate) fn state_kinds(facts: &BlockFacts) -> Vec<u8> {
++    SNOW.get_or_init(|| {
++        let mut layers = FxHashSet::default();
++        let mut block = None;
++        for i in 0..facts.states.len() {
++            let state = BlockStateId(i as u32);
++            match &*facts.get(state).name {
++                "minecraft:snow" => {
++                    layers.insert(i as u32);
++                }
++                "minecraft:snow_block" if block.is_none() => block = Some(state),
++                _ => {}
++            }
++        }
++        Snow { layers, block }
++    });
+     (0..facts.states.len())
+         .map(|i| {
+             let state = BlockStateId(i as u32);
+@@ -3664,6 +3719,28 @@ mod tests {
+         assert!(!nearly_full("minecraft:wheat"));
+     }
+     #[test]
++    fn a_snow_layer_is_drawn_as_snow_on_the_ground_under_it() {
++        // 0 air, 1 grass, 2 snow layer (not kept), 3 snow block.
++        let kinds = [AIR, KEPT, 0, KEPT];
++        let snow = Snow {
++            layers: FxHashSet::from_iter([2]),
++            block: Some(BlockStateId(3)),
++        };
++        let mut chunk = Chunk::empty(0, 0);
++        for y in MIN_Y..64 {
++            chunk.set(5, y, 5, 1);
++            chunk.set(6, y, 5, 1);
++        }
++        chunk.set(5, 64, 5, 2);
++        let snowy = Column::from_chunk(&chunk, &kinds, None, &snow, 5, 5);
++        let bare = Column::from_chunk(&chunk, &kinds, None, &snow, 6, 5);
++        let top = snowy.spans.last().unwrap();
++        assert_eq!((top.min, top.max, top.state), (63, 64, BlockStateId(3)));
++        assert_eq!(snowy.surface.unwrap().state, BlockStateId(3));
++        assert_eq!(snowy.surface.unwrap().height, 64, "the ground keeps its height");
++        assert_eq!(bare.surface.unwrap().state, BlockStateId(1));
++    }
++    #[test]
+     fn kelp_to_the_surface_is_drawn_as_water() {
+         // 0 air, 1 stone, 2 water, 3 kelp (holds water, draws as none).
+         let kinds = [AIR, KEPT, KEPT | FLUID, KEPT | FLUID | WATERY];
+@@ -3679,8 +3756,8 @@ mod tests {
+         }
+         let water = water_source(&kinds);
+         assert_eq!(water, Some(BlockStateId(2)));
+-        let kelp = Column::from_chunk(&chunk, &kinds, water, 3, 3);
+-        let sea = Column::from_chunk(&chunk, &kinds, water, 4, 3);
++        let kelp = Column::from_chunk(&chunk, &kinds, water, &Snow::default(), 3, 3);
++        let sea = Column::from_chunk(&chunk, &kinds, water, &Snow::default(), 4, 3);
+         assert_eq!(kelp.spans, sea.spans);
+         assert_eq!(
+             kelp.spans.last().map(|s| (s.min, s.max, s.state)),
+diff --git a/crates/horizon-client/src/vanillagen/lod.rs b/crates/horizon-client/src/vanillagen/lod.rs
+index 92b9d68871..2213f97461 100644
+--- a/crates/horizon-client/src/vanillagen/lod.rs
++++ b/crates/horizon-client/src/vanillagen/lod.rs
+@@ -273,6 +273,9 @@ fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Colum
+     let max = min + height;
+     let bottom = crate::chunk::ColumnLayout::of_level(min, height).min_y();
+     let water = registry.default_state("minecraft:water");
++    // A snow layer draws as the snow block's top on the ground under it, as saved chunks'
++    // columns have it (`horizon_client::lod`): left out, far snowy land showed its grass.
++    let snow_block = registry.default_state("minecraft:snow_block");
+     Arc::new(std::array::from_fn(|index| {
+         let x = (index & 15) as i32;
+         let z = (index >> 4) as i32;
+@@ -281,6 +284,21 @@ fn columns(chunk: &ProtoChunk, biome_map: &[u16], dimension: &str) -> Arc<[Colum
+             let mut state = chunk.block(x, y, z);
+             let properties = states.get(state);
+             let mut name = registry.state(state).map_or("", |s| s.name.as_str());
++            if name == "minecraft:snow" {
++                if let Some(snow) = snow_block
++                    && let Some(top) = column.spans.last_mut()
++                    && i32::from(top.max) == y
++                    && !states.get(top.state).has_fluid()
++                {
++                    top.state = snow;
++                    if let Some(surface) = column.surface.as_mut()
++                        && surface.height == y
++                    {
++                        surface.state = snow;
++                    }
++                }
++                continue;
++            }
+             if properties.is_air()
+                 || (!properties.blocks_motion_in_heightmap()
+                     && !properties.has_fluid()
+@@ -499,6 +517,7 @@ pub(super) struct VanillaLodSampler {
+     worker: GeneratorWorker,
+     builder: Option<Builder>,
+     vegetation: Arc<Vegetation>,
++    snow: Arc<FarSnow>,
+     islands: EndIslands,
+     cache: FxHashMap<(i32, i32), Arc<[Column; 256]>>,
+     order: VecDeque<(i32, i32)>,
+@@ -516,11 +535,13 @@ impl VanillaLodSampler {
+             generator.seed,
+         ));
+         let islands = EndIslands::new(generator.clone());
++        let snow = Arc::new(FarSnow::new(&generator));
+         Self {
+             generator,
+             worker,
+             builder,
+             vegetation,
++            snow,
+             islands,
+             cache: FxHashMap::default(),
+             order: VecDeque::new(),
+@@ -536,6 +557,7 @@ impl LodSampler for VanillaLodSampler {
+             worker: self.generator.generator.worker(),
+             builder: None,
+             vegetation: self.vegetation.clone(),
++            snow: self.snow.clone(),
+             islands: self.islands.fork(),
+             cache: FxHashMap::default(),
+             order: VecDeque::new(),
+@@ -684,6 +706,7 @@ impl VanillaLodSampler {
+             fill_under_surface(&mut column, |state| states.get(state).has_fluid());
+         }
+         self.vegetation.apply(&mut column, x, z, width, light);
++        self.snow.apply(&mut column, x, z);
+         self.islands.apply(&mut column, x, z, width, light);
+         if !nether {
+             shade_sky(
+@@ -696,6 +719,76 @@ impl VanillaLodSampler {
+     }
+ }
+ 
++/// Snow on far land sampled straight from the generator, which has no decoration: the snow
++/// block's top where vanilla's `freeze_top_layer` would lay snow (the biome has precipitation
++/// and is cold enough at that height, `Biome.coldEnoughToSnow`), on land, not water. Without
++/// it far snowy plains and peaks showed their grass. (UMP, 2026-11-13)
++pub(super) struct FarSnow {
++    /// By the client's biome index: the biome's climate, when it can snow at all.
++    climates: FxHashMap<u16, horizon_world::worldgen::biome_temperature::BiomeTemperatureSettings>,
++    snow: Option<BlockStateId>,
++    sea_level: i32,
++}
++impl FarSnow {
++    fn new(generator: &VanillaTerrain) -> Self {
++        let data = generator.generator.data();
++        let mut climates = FxHashMap::default();
++        for (index, &biome) in generator.biome_map.iter().enumerate() {
++            let json = data.biome_json(horizon_world::worldgen::biome::BiomeId(index as u32));
++            if let Ok(climate) =
++                horizon_world::worldgen::biome_temperature::BiomeTemperatureSettings::from_json(json)
++                && climate.has_precipitation
++            {
++                climates.insert(biome, climate);
++            }
++        }
++        Self {
++            climates,
++            snow: data.registry().default_state("minecraft:snow_block"),
++            sea_level: generator.generator.sea_level(),
++        }
++    }
++    fn apply(&self, column: &mut Column, x: i32, z: i32) {
++        let (Some(snow), Some(surface)) = (self.snow, column.surface) else {
++            return;
++        };
++        if surface.water.is_some_and(|(y, _)| y >= surface.height) {
++            return;
++        }
++        let Some(climate) = self.climates.get(&surface.biome) else {
++            return;
++        };
++        let at = horizon_core::position::BlockPos::new(x, surface.height, z);
++        if climate.height_adjusted(at, self.sea_level) >= 0.15 {
++            return;
++        }
++        // The top run's top block is snow (the layer over it, seen from afar); a canopy over
++        // the ground keeps its leaves (vanilla lays its snow on them too, but leaves stay
++        // leaves under it).
++        let Some(top) = column.spans.last_mut() else {
++            return;
++        };
++        if i32::from(top.max) != surface.height {
++            return;
++        }
++        if top.max - top.min > 1 {
++            top.max -= 1;
++            let under = *top;
++            column.push(Span {
++                min: under.max,
++                max: under.max + 1,
++                state: snow,
++                ..under
++            });
++        } else {
++            top.state = snow;
++        }
++        if let Some(surface) = column.surface.as_mut() {
++            surface.state = snow;
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     /// Either dampening lights everything under a run the same, so seabeds
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,205 @@
+From 3d8832ff0d9d87dbeadc13205cb1e59723d8da82 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 83/90] The Java client's first frame runs while the player is
+ idle at the title
+
+CLIENT_STARTED, the client's resource reload and the models' start ran on the mirror's first tick, inside the world's join (JourneyMap's CLIENT_STARTED ~2 s, ~3.3 s in all with 184 mods). Horizon now asks for it from the title's frames once the mods' start has ended and no world is opening; Java runs it once on a thread of its own and the first tick waits for it. Started at the same time as a world's opening it only competed with it (tried twice, reverted). HORIZON_EARLY_CLIENT=0 keeps it on the first tick.
+
+UMP player-flow test, 184 mods, 5 s at the title: click->in world 27/27 s (on) vs 28/29 s (off); no title wait: 31 s, as before.
+---
+ crates/horizon-client/src/game.rs             |  5 ++
+ .../src/game/java_mods/bridge.rs              | 16 +++++
+ .../horizon-client/src/game/java_mods/off.rs  |  2 +
+ .../horizonlab/platform/HorizonClient.java    | 72 +++++++++++++++----
+ .../horizonlab/platform/HorizonServer.java    |  5 ++
+ crates/horizon-jvm/src/events.rs              | 10 +++
+ 6 files changed, 98 insertions(+), 12 deletions(-)
+
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index 1060f9de15..29e2782362 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -19296,6 +19296,11 @@ impl Game<'_> {
+             }
+             return;
+         }
++        // Idle at the title, the Java mods' start over: their client's first frame now, not in the
++        // world's join (java_mods::client_start_at_title).
++        if self.title.is_some() && self.pending_entry.is_none() && self.rest_loader.is_none() {
++            java_mods::client_start_at_title();
++        }
+         if let Err(error) = horizon_client::spans::time("world_entry", || self.resume_world_entry())
+         {
+             self.error = Some(error);
+diff --git a/crates/horizon-client/src/game/java_mods/bridge.rs b/crates/horizon-client/src/game/java_mods/bridge.rs
+index 6f7cfa07fc..13dc36afbc 100644
+--- a/crates/horizon-client/src/game/java_mods/bridge.rs
++++ b/crates/horizon-client/src/game/java_mods/bridge.rs
+@@ -427,6 +427,22 @@ fn share_vulkan_instance() {
+ /// Set once Java's start has ended, whether it started or not.
+ static SETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+ 
++/// The Java mods' client's first frame while the player is idle at the title, once their start
++/// has ended: asked each idle title frame, sent to Java once (it runs it on a thread of its own,
++/// and the mirror's first tick waits for it).
++pub(in crate::game) fn client_start_at_title() {
++    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++    if ASKED.load(std::sync::atomic::Ordering::Relaxed)
++        || !SETTLED.load(std::sync::atomic::Ordering::SeqCst)
++        || !horizon_jvm::events::ready()
++    {
++        return;
++    }
++    ASKED.store(true, std::sync::atomic::Ordering::Relaxed);
++    log::info!("Java mods: their client's first frame starts at the title");
++    horizon_jvm::events::client_start_at_title();
++}
++
+ /// Waits (up to `limit`) for the Java mods' start to end: whether the platform mod runs.
+ pub(in crate::game) fn wait_for_java(limit: std::time::Duration) -> bool {
+     let until = std::time::Instant::now() + limit;
+diff --git a/crates/horizon-client/src/game/java_mods/off.rs b/crates/horizon-client/src/game/java_mods/off.rs
+index 7c7dbd4278..0c06257a94 100644
+--- a/crates/horizon-client/src/game/java_mods/off.rs
++++ b/crates/horizon-client/src/game/java_mods/off.rs
+@@ -21,6 +21,8 @@ pub(in crate::game) fn java_creative(_out: &Path) {}
+ pub(in crate::game) fn level_named(id: &str) -> Dim {
+     Dim::from_id(id)
+ }
++/// The Java mods' client at the title: there is none.
++pub(in crate::game) fn client_start_at_title() {}
+ /// Whether Java mods run: never.
+ pub(in crate::game) fn has_java_mods() -> bool {
+     false
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index 00db4cb2a9..b3db888b83 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -1829,19 +1829,19 @@ public final class HorizonClient {
+             gpuParts = true;
+             if (HorizonGpu.installed()) guiRenderer(minecraft.gameRenderer);
+         }
+-        tasks();
+-        // ClientLifecycleEvents.CLIENT_STARTED: Minecraft's first frame, before any world (Jade
+-        // finishes registering its tooltip providers there).
+-        if (!started) {
+-            started = true;
+-            reloadClientResources();
+-            // The GPU's shaders: the GUI pipelines' fallback cache over the client's resources
+-            // (vanilla's and the mods' shaders), as Minecraft's start makes it.
+-            if (HorizonGpu.installed() && minecraft.getResourceManager() != null) models();
+-            HorizonServer.fireEach("ClientLifecycleEvents.CLIENT_STARTED",
+-                    net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STARTED, l -> l.onClientStarted(minecraft));
+-            reloadAddedListeners();
++        // The client's first frame, if it started at the title (startAtTitle): done before this tick.
++        Thread early = earlyStart;
++        if (early != null) {
++            try {
++                early.join();
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++            }
++            earlyStart = null;
++            renderThread();
+         }
++        tasks();
++        clientStart();
+         finishModels();
+         // Its loading is done once the models are (Minecraft.isGameLoadFinished: MiniHUD draws
+         // nothing before).
+@@ -1955,6 +1955,54 @@ public final class HorizonClient {
+     }
+ 
+     private static boolean started;
++    private static volatile Thread earlyStart;
++
++    /**
++     * ClientLifecycleEvents.CLIENT_STARTED: Minecraft's first frame, before any world (Jade
++     * finishes registering its tooltip providers there), with the client's resource reload and the
++     * models' reload started before it. Once.
++     */
++    private static synchronized void clientStart() {
++        if (started) return;
++        started = true;
++        reloadClientResources();
++        // The GPU's shaders: the GUI pipelines' fallback cache over the client's resources
++        // (vanilla's and the mods' shaders), as Minecraft's start makes it.
++        if (HorizonGpu.installed() && minecraft.getResourceManager() != null) models();
++        HorizonServer.fireEach("ClientLifecycleEvents.CLIENT_STARTED",
++                net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STARTED, l -> l.onClientStarted(minecraft));
++        reloadAddedListeners();
++    }
++
++    /**
++     * The client's first frame (clientStart) while the player is idle at the title screen, on a
++     * thread of its own: a client's first frame comes before any world, and here it ran in the
++     * world's join (JourneyMap's CLIENT_STARTED ~2 s, the client reload and the models' start ~1 s,
++     * with 184 mods). Horizon asks for it from the title's frames while no world is being opened;
++     * the mirror's first tick waits for it. Started with a world opening at the same time it
++     * competed with the world's Java start and gained nothing (UMP, 2026-11-15).
++     * HORIZON_EARLY_CLIENT=0: on the first tick as before.
++     */
++    public static void startAtTitle() {
++        if (started || earlyStart != null || minecraft == null || minecraft.font == null
++                || "0".equals(System.getenv("HORIZON_EARLY_CLIENT"))) return;
++        ClassLoader loader = HorizonClient.class.getClassLoader();
++        Thread thread = new Thread(() -> {
++            Thread.currentThread().setContextClassLoader(loader);
++            long began = System.nanoTime();
++            try {
++                renderThread();
++                clientStart();
++            } catch (Throwable t) {
++                Natives.log("Horizon's client: its first frame failed: " + t);
++            }
++            Natives.log("Horizon's client: its first frame (resources, CLIENT_STARTED) ran at the title in "
++                    + (System.nanoTime() - began) / 1_000_000 + " ms");
++        }, "Horizon client start");
++        thread.setDaemon(true);
++        earlyStart = thread;
++        thread.start();
++    }
+ 
+     /**
+      * The client's block and item models, as Minecraft's resource reload makes them, now that
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index 8253b32379..e2aeec8e4d 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -946,6 +946,11 @@ public final class HorizonServer {
+         return HorizonFunctions.ready();
+     }
+ 
++    /** The headless client's first frame now, on its own thread (HorizonClient.startAtTitle). */
++    public static void clientStartAtTitle() {
++        HorizonClient.startAtTitle();
++    }
++
+     private static boolean starting;
+ 
+     /**
+diff --git a/crates/horizon-jvm/src/events.rs b/crates/horizon-jvm/src/events.rs
+index 419f94db85..873e3aba4a 100644
+--- a/crates/horizon-jvm/src/events.rs
++++ b/crates/horizon-jvm/src/events.rs
+@@ -2349,6 +2349,16 @@ pub fn functions_ready() -> bool {
+     .unwrap_or(true)
+ }
+ 
++/// The headless client's first frame (its resource reload, CLIENT_STARTED) now, on a thread of
++/// its own, while the player is idle at the title: `HorizonServer.clientStartAtTitle`. Java runs
++/// it once.
++pub fn client_start_at_title() {
++    let _ = with_server(|env, class| {
++        env.call_static_method(class, "clientStartAtTitle", "()V", &[])?;
++        Ok(())
++    });
++}
++
+ /// Whether the Java mods' client reads its network connection's packets (a mod hooks how a
+ /// client's `Connection` reads them: ReplayMod, Flashback): `HorizonPacketTap.wanted`. Then
+ /// the game keeps what the server sends the window's own player and passes it each tick
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,47 @@
+From 915e1dfa1c45558b4684cfeaf19a335c3d7bc252 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 50/90] Java mods' profile: each HUD part's time, and the
+ picture in picture draw
+
+HORIZON_JAVA_PROFILE now names which mod's HUD costs the tick (HUD <part>, HUD: picture in picture drawn). UMP, 300 mods: Xaero's minimap 3.5-12 ms of the 9-14 ms HUD.
+---
+ .../java/platform/dev/horizonlab/platform/HorizonClient.java  | 4 ++++
+ .../platform/dev/horizonlab/platform/HorizonGraphics.java     | 2 ++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+index 5f354f721c..a672c12987 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonClient.java
+@@ -3674,8 +3674,12 @@ public final class HorizonClient {
+         // minimap: RenderSystem.getDevice()) fails every frame.
+         Integer failed = HUD_FAILURES.get(part);
+         if (failed != null && failed >= 3) return;
++        // Each part's time in the profile (HORIZON_JAVA_PROFILE): which mod's overlay the
++        // HUD's cost is. (UMP, 2026-11-13)
++        long started = HorizonProfile.start();
+         try {
+             run.run();
++            HorizonProfile.add("HUD " + part, started);
+             if (failed != null) HUD_FAILURES.remove(part);
+         } catch (Throwable t) {
+             Throwable root = t;
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonGraphics.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonGraphics.java
+index 8f65415b3a..4ab301259c 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonGraphics.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonGraphics.java
+@@ -127,8 +127,10 @@ public final class HorizonGraphics extends GuiGraphicsExtractor {
+             Object[] record = {now, null};
+             PIP_LAST.put(key, record);
+             owner.recording = record;
++            long started = HorizonProfile.start();
+             try {
+                 prepare(renderer, state, this);
++                HorizonProfile.add("HUD: picture in picture drawn", started);
+             } catch (Throwable t) {
+                 if (PIP_FAILURES.merge(state.getClass().getName(), 1, Integer::sum) <= 3) {
+                     Natives.log("Horizon's client: a picture in picture (" + state.getClass().getName() + ") failed: " + t);
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,144 @@
+From 385307dc24084ca5720cdfc86a7a0bdc8888c165 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 88/90] Selectors: entity type tags from memory, nbt= patterns
+ parsed once; slow tick functions named
+
+@e[type=#tag] read and parsed the tag's JSON file for every entity tested (only vanilla's tags, from the resources folder): with 300 mods a data pack's tick function made each tick 100-200 ms of file reads. It now asks the entity type tags loaded with the game's data (every pack's, nested tags resolved). A selector's nbt= patterns are parsed once for all candidates, not once each. Tick functions over 5 ms are summed and logged every 10 s by name.
+
+UMP top300, LOD 512, flying: 1% low 41 -> 59 fps, avg 164 -> 199, tick 744 -> 338 ms. Left: Mr. Guns++ thepa:loop ~41 ms a tick (nbt= selectors on players). Test: teleport_and_rotate_resolve_pitch_at_their_own_boundary (type=#minecraft:undead).
+---
+ crates/horizon-client/src/game/commands.rs   | 28 ++++++++++++--------
+ crates/horizon-client/src/game/functions.rs  | 25 +++++++++++++++++
+ crates/horizon-client/src/game/scoreboard.rs | 17 +++++++++---
+ 3 files changed, 55 insertions(+), 15 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/commands.rs b/crates/horizon-client/src/game/commands.rs
+index 51ad7de57d..62d5b45851 100644
+--- a/crates/horizon-client/src/game/commands.rs
++++ b/crates/horizon-client/src/game/commands.rs
+@@ -1017,18 +1017,18 @@ impl Game<'_> {
+         }
+         None
+     }
++    /// `@e[type=#tag]`: from the entity type tags loaded with the game's data (every pack's, the
++    /// mods' included, nested tags resolved). It read and parsed the tag's JSON file for every
++    /// entity a selector tested: a data pack's tick function with such a selector made each tick
++    /// 100-200 ms of file reads with 300 mods (UMP flight profile: entity_tag_matches ->
++    /// std::fs::read in compute_condition), and only saw vanilla's own tags. (UMP, 2026-11-15)
+     fn entity_tag_matches(&self, tag: &str, ty: &str) -> bool {
+-        let path = self.options.resources.join(format!(
+-            "data/minecraft/tags/entity_type/{}.json",
+-            tag.trim_start_matches("minecraft:")
+-        ));
+-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap_or_default())
+-            .ok()
+-            .is_some_and(|v| {
+-                v["values"]
+-                    .as_array()
+-                    .is_some_and(|a| a.iter().any(|e| e.as_str() == Some(ty)))
+-            })
++        let tag = if tag.contains(':') {
++            std::borrow::Cow::Borrowed(tag)
++        } else {
++            std::borrow::Cow::Owned(format!("minecraft:{tag}"))
++        };
++        self.res.mob_data().entity_has(&tag, ty)
+     }
+     /// EntityArgument.getEntities / getPlayers / getEntity / getPlayer.
+     pub(super) fn entities(&mut self, ctx: &Context, name: &str, players: bool) -> R<Vec<Target>> {
+@@ -4191,6 +4191,12 @@ mod teleport_pitch_tests {
+             )));
+             assert_eq!(game.mobs[0].head_pitch, expected);
+         }
++        // `type=#tag` from the loaded entity type tags: a zombie is undead, not a raider.
++        assert!(game.entity_tag_matches("minecraft:undead", "minecraft:zombie"));
++        assert!(game.entity_tag_matches("undead", "minecraft:zombie"));
++        assert!(!game.entity_tag_matches("minecraft:raiders", "minecraft:zombie"));
++        assert!(game.run_command("tp @e[type=#minecraft:undead,limit=1] 0 0 0 0 0"));
++        assert!(!game.run_command("tp @e[type=#minecraft:raiders,limit=1] 0 0 0 0 0"));
+         game.yaw = 190.0;
+         game.mobs[0].yaw = 170.0;
+         assert!(game.run_command("tp @e[type=minecraft:zombie,limit=1] 0 0 0 ~ ~"));
+diff --git a/crates/horizon-client/src/game/functions.rs b/crates/horizon-client/src/game/functions.rs
+index 090a22409f..ddc538f021 100644
+--- a/crates/horizon-client/src/game/functions.rs
++++ b/crates/horizon-client/src/game/functions.rs
+@@ -385,8 +385,28 @@ impl Game<'_> {
+                 None => self.run_function_by_id(&event.id, None, source),
+             }
+         }
++        // Each tick function timed on its own: the slow-tick line names the data pack's function
++        // that costs the tick (a mod's per-tick selectors). (UMP, 2026-11-15)
++        let started = std::time::Instant::now();
+         for f in self.fns.store.tag_functions("minecraft:tick") {
++            let one = std::time::Instant::now();
+             self.run_function_by_id(&f, None, source);
++            let ms = one.elapsed().as_secs_f32() * 1000.0;
++            if ms >= 5.0 {
++                SLOW_TICK_FUNCTIONS.with(|m| *m.borrow_mut().entry(f.clone()).or_insert(0.0) += ms);
++            }
++        }
++        // Every ~10 s, the tick functions that cost 5 ms or more, by total time.
++        if started.elapsed().as_millis() > 0 && self.world.game_time % 200 == 0 {
++            SLOW_TICK_FUNCTIONS.with(|m| {
++                let mut m = m.borrow_mut();
++                if !m.is_empty() {
++                    let mut all: Vec<_> = m.drain().collect();
++                    all.sort_by(|a, b| b.1.total_cmp(&a.1));
++                    let list: Vec<String> = all.iter().take(6).map(|(f, ms)| format!("{f} {ms:.0} ms")).collect();
++                    log::info!("Horizon: slow tick functions over 10 s: {}", list.join(", "));
++                }
++            });
+         }
+     }
+     fn run_function_by_id(&mut self, id: &str, args: Option<&Tag>, source: Source) {
+@@ -1129,3 +1149,8 @@ mod tests {
+         let _ = std::fs::remove_dir_all(&dir);
+     }
+ }
++
++thread_local! {
++    /// Tick functions that took 5 ms or more since the last report (tick_functions), in ms.
++    static SLOW_TICK_FUNCTIONS: std::cell::RefCell<std::collections::HashMap<String, f32>> = std::cell::RefCell::new(std::collections::HashMap::new());
++}
+diff --git a/crates/horizon-client/src/game/scoreboard.rs b/crates/horizon-client/src/game/scoreboard.rs
+index a62f24f316..467506460d 100644
+--- a/crates/horizon-client/src/game/scoreboard.rs
++++ b/crates/horizon-client/src/game/scoreboard.rs
+@@ -294,6 +294,14 @@ impl Game<'_> {
+     ) -> HashSet<Target> {
+         let mut pass = HashSet::new();
+         let needs_holder = !s.scores.is_empty() || !s.teams.is_empty();
++        // The `nbt=` patterns parsed once for every candidate, not once each.
++        let patterns: Vec<(Option<horizon_world::nbt::Tag>, bool)> = s
++            .nbt
++            .iter()
++            .map(|(pattern, negated)| {
++                (horizon_world::nbt::parse_snbt(pattern).ok().map(|(p, _)| p), *negated)
++            })
++            .collect();
+         for &t in candidates {
+             let mut ok = true;
+             if needs_holder {
+@@ -337,12 +345,13 @@ impl Game<'_> {
+             if ok && !s.nbt.is_empty() {
+                 // NbtPredicate: the entity's saved data contains the pattern.
+                 let data = self.entity_nbt(t);
+-                for (pattern, negated) in &s.nbt {
+-                    let matches = match (&data, horizon_world::nbt::parse_snbt(pattern)) {
+-                        (Some(d), Ok((p, _))) => horizon_client::nbt_path::compare_nbt(&p, Some(d)),
++                for (pattern, negated) in &patterns {
++                    let negated = *negated;
++                    let matches = match (&data, pattern) {
++                        (Some(d), Some(p)) => horizon_client::nbt_path::compare_nbt(p, Some(d)),
+                         _ => false,
+                     };
+-                    if matches == *negated {
++                    if matches == negated {
+                         ok = false;
+                     }
+                 }
+-- 
+2.56.0.windows.2
+

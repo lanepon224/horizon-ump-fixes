@@ -1,0 +1,30 @@
+From cc3e4c6c684c31e06d3a66f74f6c494c0b412f7c Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 73/90] Mods' forced chunks generate as near as the player's
+
+Ranges::priority ranked /forceload's chunks with the player's own (vanilla's FORCED ticket level), but not the Java mods' tickets (mod_forced): a data pack's forceload through the mods' server (0 0, the join's load functions wait on it) queued behind the whole spawn area.
+
+UMP 184 mods: the forced chunk loads 6-7 s after it was asked (was 14 s); streaming tests 25/25.
+---
+ crates/horizon-client-render/src/streaming.rs | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client-render/src/streaming.rs b/crates/horizon-client-render/src/streaming.rs
+index f6bdb4637f..bf5685830e 100644
+--- a/crates/horizon-client-render/src/streaming.rs
++++ b/crates/horizon-client-render/src/streaming.rs
+@@ -2817,7 +2817,9 @@ impl Ranges<'_> {
+         // A forced chunk is as near as the player's own (vanilla's FORCED ticket is level
+         // 31, the player's chunk's), and so is the work around it: data packs forceload a
+         // chunk far away and use it at once (Skyblock Infinite's island at 0 0).
+-        for f in self.forced {
++        // The Java mods' tickets too (a data pack's forceload through their server: the chunk
++        // waited behind the whole spawn area, ~6 s of a 184-mod join). (UMP, 2026-11-14)
++        for f in self.forced.iter().chain(self.mod_forced.iter()) {
+             let (dx, dz) = (i64::from(x - f.0), i64::from(z - f.1));
+             own = own.min(dx * dx + dz * dz);
+         }
+-- 
+2.56.0.windows.2
+

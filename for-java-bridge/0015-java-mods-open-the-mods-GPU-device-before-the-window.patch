@@ -1,0 +1,65 @@
+From d60cc04af82e19a6d9828c2aa9c05c9e69367b61 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 15/90] java mods: open the mods' GPU device before the
+ window's swapchain
+
+On a warm start the Java mods' device opened on the window's Vulkan instance after its swapchain, while an overlay that hooks the window's present (RivaTuner/RTSS with MSI Afterburner) was loaded: the AMD driver (amdvlk64 26.10.1, RX 7600) crashed at the next present, every warm start in a window (stack: RTSSHooks64 -> vulkan-1 -> amdvlk64 from wgpu_hal Swapchain::present). First starts, where Java's device opens first, never did. The window now asks for the shared instance when Java mods are on, which opens the Java device first; share_vulkan_instance runs as soon as mods-java/ has jars.
+
+Found by UMP's new-player test (start again -> open world). 3 runs, 0 crashes after; 8 before.
+---
+ crates/horizon-client/src/game/java_mods/bridge.rs | 14 +++++++++++++-
+ crates/horizon-jvm/src/gpu/mod.rs                  |  5 +++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-client/src/game/java_mods/bridge.rs b/crates/horizon-client/src/game/java_mods/bridge.rs
+index 37d1547548..35504a75b4 100644
+--- a/crates/horizon-client/src/game/java_mods/bridge.rs
++++ b/crates/horizon-client/src/game/java_mods/bridge.rs
+@@ -52,6 +52,10 @@ pub(in crate::game) fn mod_jars() -> (PathBuf, Vec<PathBuf>) {
+     let dir = Game::options_path().with_file_name(horizon_jvm::DIR);
+     if opted_in() {
+         let jars = run_jars(&dir);
++        if !jars.is_empty() {
++            // Before the window opens (the content root is read first): see share_vulkan_instance.
++            share_vulkan_instance();
++        }
+         return (dir, jars);
+     }
+     static SAID: std::sync::Once = std::sync::Once::new();
+@@ -401,7 +405,15 @@ pub(in crate::game) fn level_named(id: &str) -> super::super::Dim {
+ /// a second instance's device enumeration crashed in the Vulkan loader (Fedora 43, RADV, the
+ /// user's PC, 2026-11-05: the game died opening its window after Java's device was up).
+ fn share_vulkan_instance() {
+-    let _ = horizon_client::gfx::SHARED_INSTANCE.set(horizon_jvm::gpu::instance);
++    // The window asks for the instance when it opens: the Java mods' device opens then, first,
++    // so it always comes before the window's swapchain. Opened after it (a warm start, where
++    // Java's start and the window race), an overlay hooking the window's present (RivaTuner/RTSS,
++    // MSI Afterburner) crashed in the AMD driver on the first frame after (UMP's new-player
++    // test, Windows, RX 7600): first starts, Java's device first, never did. (UMP, 2026-11-11)
++    let _ = horizon_client::gfx::SHARED_INSTANCE.set(|| {
++        horizon_jvm::gpu::open_now();
++        horizon_jvm::gpu::instance()
++    });
+     let _ = horizon_jvm::gpu::SHARED_INSTANCE.set(horizon_client::gfx::own_instance);
+ }
+ 
+diff --git a/crates/horizon-jvm/src/gpu/mod.rs b/crates/horizon-jvm/src/gpu/mod.rs
+index 516ae5cadd..0dce77ba15 100644
+--- a/crates/horizon-jvm/src/gpu/mod.rs
++++ b/crates/horizon-jvm/src/gpu/mod.rs
+@@ -1444,6 +1444,11 @@ unsafe fn bytes<'a>(address: jlong, len: jlong) -> &'a [u8] {
+     unsafe { std::slice::from_raw_parts(address as *const u8, len as usize) }
+ }
+ 
++/// Opens the device now if it isn't (the game's window asks first, so this device comes first).
++pub fn open_now() {
++    with((), |_| ());
++}
++
+ /// Runs `f` on the device (opened on first use); `default` when there is none.
+ fn with<T>(default: T, f: impl FnOnce(&mut Gpu) -> T) -> T {
+     let mut guard = GPU.lock().unwrap_or_else(|e| e.into_inner());
+-- 
+2.56.0.windows.2
+

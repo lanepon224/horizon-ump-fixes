@@ -1,0 +1,83 @@
+From bc9330472e3ff0cbd0b87f44be5e68e9fae96b8c Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 37/90] java mods: a mods/ folder and loot tables a mod ships
+ in an old form no longer stop the game
+
+Yuushya 2.3.0 reads add-on packs from the game folder's mods/, which a launcher always makes and Horizon doesn't (its Java mods are in mods-java/): its entrypoint failed and Fabric didn't start. FabricBoot makes an empty mods/ beside mods-java/.
+
+Yuushya also ships 18 loot tables in the pre-26.3 form (condition minecraft:block_state_property); one unreadable loot table made the whole registry load fail. Loot tables join recipes and advancements as entries left out with a line (those blocks drop nothing); a mod with many is summed up after its first three.
+
+Found by UMP's weekly new-mod check: 185 jars (293 Fabric mods) now load together and join a world.
+---
+ .../dev/horizonlab/bridge/fabric/FabricBoot.java |  8 ++++++++
+ .../platform/mixin/TolerantRegistryMixin.java    | 16 +++++++++++++---
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java b/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
+index 32e099150e..c4b0c3548c 100644
+--- a/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
++++ b/crates/horizon-jvm/java/dev/horizonlab/bridge/fabric/FabricBoot.java
+@@ -48,6 +48,14 @@ public final class FabricBoot {
+         HorizonGameProvider.version = version;
+         HorizonGameProvider.gameJar = Paths.get(gameJar).toAbsolutePath();
+         HorizonGameProvider.gameDir = Paths.get(gameDir).toAbsolutePath();
++        // A vanilla game folder always has mods/ (a launcher makes it): mods read their add-on
++        // packs from there (Yuushya's addons) and fail to start when it's missing. Horizon keeps
++        // Java mods in mods-java/, so an empty mods/ is made beside it. (UMP, 2026-11-12)
++        try {
++            java.nio.file.Files.createDirectories(HorizonGameProvider.gameDir.resolve("mods"));
++        } catch (java.io.IOException | RuntimeException e) {
++            // A read-only game folder: mods that need it say so themselves.
++        }
+         List<Path> libs = new ArrayList<>();
+         for (String library : libraries) libs.add(Paths.get(library).toAbsolutePath());
+         HorizonGameProvider.libraries = libs;
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
+index f21636bc8c..2a65711a3e 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/mixin/TolerantRegistryMixin.java
+@@ -19,16 +19,22 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+  * world load. Mods ship data for other mods' versions (Just Enough Breeding 3.4.1's Friends &amp; Foes recipes fail
+  * to parse with Friends &amp; Foes 5.0.4, on plain Minecraft too), so one stale file made a 100-mod pack unplayable.
+  * These leaf entries are now left out with a line naming them; every other registry error still fails as vanilla's.
++ * Loot tables too (UMP, 2026-11-12): Yuushya 2.3.0 ships 300+ in the pre-26.3 form ("condition":
++ * "minecraft:block_state_property"), which stopped the game; such a block drops nothing when broken instead. A mod
++ * with many is summed up in one line after its first few.
+  */
+ @Mixin(RegistryDataLoader.class)
+ public abstract class TolerantRegistryMixin {
+-    private static final Set<ResourceKey<?>> TOLERATED = Set.of(Registries.RECIPE, Registries.ADVANCEMENT);
++    private static final Set<ResourceKey<?>> TOLERATED = Set.of(Registries.RECIPE, Registries.ADVANCEMENT, Registries.LOOT_TABLE);
++    /** Lines said in full a mod and registry; the rest are counted. */
++    private static final int SAID = 3;
+ 
+     @Inject(method = "lambda$load$2", at = @At("HEAD"), require = 0)
+     private static void horizon$leaveOutBrokenData(List<?> tasks, Map<ResourceKey<?>, Exception> errors, Void unused,
+                                                    CallbackInfoReturnable<?> cir) {
+         if (errors == null || errors.isEmpty()) return;
+         synchronized (errors) {
++            Map<String, Integer> counts = new java.util.TreeMap<>();
+             for (Iterator<Map.Entry<ResourceKey<?>, Exception>> it = errors.entrySet().iterator(); it.hasNext();) {
+                 var e = it.next();
+                 ResourceKey<?> key = e.getKey();
+@@ -37,10 +43,14 @@ public abstract class TolerantRegistryMixin {
+                 while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+                 String why = String.valueOf(root.getMessage());
+                 if (why.length() > 160) why = why.substring(0, 160) + "...";
+-                Natives.log("Java mods: " + key.identifier().getNamespace() + "'s " + key.registry().getPath() + " "
+-                        + key.identifier() + " can't be read (left out): " + why);
++                String group = key.identifier().getNamespace() + "'s " + key.registry().getPath();
++                int n = counts.merge(group, 1, Integer::sum);
++                if (n <= SAID) Natives.log("Java mods: " + group + " " + key.identifier() + " can't be read (left out): " + why);
+                 it.remove();
+             }
++            counts.forEach((group, n) -> {
++                if (n > SAID) Natives.log("Java mods: " + group + ": " + n + " entries can't be read and are left out (first " + SAID + " above)");
++            });
+         }
+     }
+ }
+-- 
+2.56.0.windows.2
+

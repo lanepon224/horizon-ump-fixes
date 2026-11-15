@@ -1,0 +1,37 @@
+From a514e6e0c66f706bfc4254c96d9e99b3cb0f7d92 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 29/90] java mods: far terrain's land from the mods' noise is
+ made beside the join
+
+The second generator far terrain samples the mods' land from (Java's noise export, then its worldgen data: 10-20 s with a big pack) was made when the first far tile asked for it, so far terrain started that wait once the player was in. It is made on its own thread as soon as the mods start generating the dimension. UMP perf_test, 100 mods, LOD 512: far terrain filled in 28 s (was 40-48).
+---
+ crates/horizon-client/src/game/java_worldgen.rs | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/crates/horizon-client/src/game/java_worldgen.rs b/crates/horizon-client/src/game/java_worldgen.rs
+index 00003e1dc1..fb3ff7f36b 100644
+--- a/crates/horizon-client/src/game/java_worldgen.rs
++++ b/crates/horizon-client/src/game/java_worldgen.rs
+@@ -235,6 +235,18 @@ impl JavaTerrain {
+             if !modded {
+                 self.custom.get_or_init(|| false);
+                 self.inner.no_oracle();
++            } else {
++                // The far terrain's land from the mods' noise (exported from Java, then a second
++                // generator's data: 10-20 s with a big pack) is made now, beside the join, not when
++                // the first far tile asks for it: far terrain then fills in once the world is in
++                // instead of starting the wait there. (UMP, 2026-11-11)
++                let land = self.land.clone();
++                let _ = std::thread::Builder::new()
++                    .name("Far terrain noise".into())
++                    .spawn(move || {
++                        horizon_threads::far_terrain_current();
++                        let _ = land.terrain();
++                    });
+             }
+             modded
+         })
+-- 
+2.56.0.windows.2
+

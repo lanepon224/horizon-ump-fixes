@@ -1,0 +1,106 @@
+From 1f8fc84fd2b563723b46750f34e6636e3c699abe Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 57/90] Mods' content root bundled into one data file, as the
+ prepared folder is
+
+A big pack's content root has about 200,000 small files (its mods' models, recipes, loot tables, textures). Each start opened every one it read, milliseconds each on Windows, where a file's first read is scanned: most of a warm start. resource_root now writes the root's horizon-data.bin (prepared_files::write) once for a built root, again when the root is rebuilt or the bundle no longer matches it; readers already ask it first. prepared_files::write reads the files by several threads (writing the bundle one file at a time took over ten minutes).
+
+UMP, 184 mods, warm start on an SSD: ready 241 -> 151-162 s (core tables 85 -> 18 s).
+---
+ crates/horizon-client/src/mod_content.rs  | 22 ++++++++++++++
+ crates/horizon-core/src/prepared_files.rs | 35 +++++++++++++++++++----
+ 2 files changed, 51 insertions(+), 6 deletions(-)
+
+diff --git a/crates/horizon-client/src/mod_content.rs b/crates/horizon-client/src/mod_content.rs
+index 9275d079e2..86131a9c2e 100644
+--- a/crates/horizon-client/src/mod_content.rs
++++ b/crates/horizon-client/src/mod_content.rs
+@@ -2946,15 +2946,37 @@ pub fn resource_root(base: &Path, mods: &[ContentMod], cache: &Path) -> Result<P
+         // A reused root warns as the build did.
+         let warnings = fs::read_to_string(out.join(WARNINGS)).unwrap_or_default();
+         warnings.lines().for_each(|w| log::warn!("Horizon: {w}"));
++        bundle_files(&out);
+         return Ok(out);
+     }
+     for warning in build(base, mods, &out)? {
+         log::warn!("Horizon: {warning}");
+     }
+     fs::write(out.join(STAMP), stamp)?;
++    bundle_files(&out);
+     Ok(out)
+ }
+ 
++/// The content root's small files in one file (`horizon_core::prepared_files`), as the
++/// prepared folder has them: a big pack's root holds about 200,000 (its mods' models, recipes,
++/// loot tables, textures), and each start opened every one it read, at milliseconds a file
++/// on Windows (the first read of a file is scanned), most of a start. Written once for a root
++/// (again when it is rebuilt or the bundle no longer matches); a failure only costs speed.
++/// (UMP, 2026-11-14)
++fn bundle_files(out: &Path) {
++    if horizon_core::prepared_files::open(out).is_some() {
++        return;
++    }
++    let started = std::time::Instant::now();
++    match horizon_core::prepared_files::write(out) {
++        Ok(()) => log::info!(
++            "Horizon: the mods' content files bundled into one in {:.1}s",
++            started.elapsed().as_secs_f32()
++        ),
++        Err(e) => log::warn!("Horizon: the mods' content files were not bundled: {e}"),
++    }
++}
++
+ /// In a root built by [`build`]: its warnings, one per line.
+ const WARNINGS: &str = "horizon-mod-content-warnings.txt";
+ 
+diff --git a/crates/horizon-core/src/prepared_files.rs b/crates/horizon-core/src/prepared_files.rs
+index 2f9e872184..4356cabfe8 100644
+--- a/crates/horizon-core/src/prepared_files.rs
++++ b/crates/horizon-core/src/prepared_files.rs
+@@ -311,13 +311,36 @@ pub fn write(root: &Path) -> io::Result<()> {
+                 .collect::<Vec<_>>()
+                 .as_slice(),
+         )?;
+-        for (_, path, len) in &files {
+-            let bytes = fs::read(path)?;
+-            // Changed since it was listed: the offsets would be wrong.
+-            if bytes.len() as u64 != *len {
+-                return Err(io::Error::other(format!("{} changed", path.display())));
++        // Read by several threads a batch at a time, written in order: a modded pack's content
++        // root has about 200,000 files, and read one at a time (each first read scanned on
++        // Windows) writing the file took over ten minutes. (UMP, 2026-11-14)
++        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
++        for batch in files.chunks(4096) {
++            let per = batch.len().div_ceil(threads).max(1);
++            let read: Vec<io::Result<Vec<u8>>> = std::thread::scope(|scope| {
++                let jobs: Vec<_> = batch
++                    .chunks(per)
++                    .map(|part| {
++                        scope.spawn(move || {
++                            part.iter().map(|(_, path, _)| fs::read(path)).collect::<Vec<_>>()
++                        })
++                    })
++                    .collect();
++                jobs.into_iter()
++                    .flat_map(|job| {
++                        job.join()
++                            .unwrap_or_else(|_| vec![Err(io::Error::other("a reading thread panicked"))])
++                    })
++                    .collect()
++            });
++            for ((_, path, len), bytes) in batch.iter().zip(read) {
++                let bytes = bytes?;
++                // Changed since it was listed: the offsets would be wrong.
++                if bytes.len() as u64 != *len {
++                    return Err(io::Error::other(format!("{} changed", path.display())));
++                }
++                out.write_all(&bytes)?;
+             }
+-            out.write_all(&bytes)?;
+         }
+         out.into_inner()
+             .map_err(io::IntoInnerError::into_error)?
+-- 
+2.56.0.windows.2
+

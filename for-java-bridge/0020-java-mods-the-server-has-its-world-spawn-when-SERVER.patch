@@ -1,0 +1,38 @@
+From 08c148a365876f315bdf462a0991201852aee0e4 Mon Sep 17 00:00:00 2001
+From: UMP <ump@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 00:00:00 +0000
+Subject: [PATCH 20/90] java mods: the server has its world spawn when
+ SERVER_STARTED fires
+
+A started server's command source runs at its world spawn; the mirror set it only with the load functions or this game's own player, after SERVER_STARTED. Spawn Animations sends its config as a command there and failed on a null spawn. Set from the world data before the event. UMP 100-mod gap run: 0 such failures (1 before).
+---
+ .../dev/horizonlab/platform/HorizonServer.java      | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+index aa1c1bdf7d..37d10bd165 100644
+--- a/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
++++ b/crates/horizon-jvm/java/platform/dev/horizonlab/platform/HorizonServer.java
+@@ -1585,7 +1585,18 @@ public final class HorizonServer {
+             for (ServerLevel made : new ArrayList<>(LEVELS.values())) levelLoaded(made);
+             hook(server, MinecraftServer.class, "loadLevel", "()V", "RETURN", NO_ARGUMENTS);
+             hook(server, MinecraftServer.class, "loadLevel", "()V", "TAIL", NO_ARGUMENTS);
+-            fireEach("ServerLifecycleEvents.SERVER_STARTED", ServerLifecycleEvents.SERVER_STARTED, l -> l.onServerStarted(server));
++            // The world spawn a started server has (its command source runs at it: Spawn Animations
++        // sends its config as a command at SERVER_STARTED and got a null spawn). (UMP, 2026-11-11)
++        try {
++            java.lang.reflect.Field respawn = MinecraftServer.class.getDeclaredField("effectiveRespawnData");
++            respawn.setAccessible(true);
++            if (respawn.get(server) == null && server.getWorldData() != null) {
++                respawn.set(server, server.getWorldData().overworldData().getRespawnData());
++            }
++        } catch (ReflectiveOperationException | RuntimeException e) {
++            // Not there to give: a mod using it says so.
++        }
++        fireEach("ServerLifecycleEvents.SERVER_STARTED", ServerLifecycleEvents.SERVER_STARTED, l -> l.onServerStarted(server));
+         }
+         // MinecraftServer.tickServer's head (Fabric's START_SERVER_TICK is its own injection there).
+         Object[] haveTime = {(java.util.function.BooleanSupplier) () -> true};
+-- 
+2.56.0.windows.2
+
